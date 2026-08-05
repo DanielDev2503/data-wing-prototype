@@ -7,15 +7,22 @@ export interface GameConfig {
   readonly worldHeight: number;
   readonly shipSize: number;
   readonly shipRadius: number;
-  readonly thrustForce: number;
-  readonly rotationSpeed: number;
+
+  // Modifiable accelerations
+  readonly thrustForce: number;          // Base forward auto-acceleration
+  readonly turnAcceleration: number;     // Configurable extra acceleration applied when turning
+  readonly rotationSpeed: number;        // Angular turning speed
+  readonly boostForce: number;           // Tangential/perpendicular boost force printed by wall onto ship
+
   readonly frictionAir: number;
   readonly brakeFrictionAir: number;
   readonly maxSpeed: number;
   readonly maxBoostSpeed: number;
-  readonly wallRecoilForce: number;
+
+  // Collision recoil
+  readonly wallRecoilForce: number;      // Constant recoil impulse magnitude on collision regardless of impact speed/direction
   readonly wallStunDuration: number;
-  readonly boostMaxMultiplier: number;
+
   readonly boostRayLength: number;
   readonly boostFadeRate: number;
   readonly trailMaxLength: number;
@@ -38,17 +45,24 @@ export const GAME_CONFIG: GameConfig = {
   worldHeight: 3000,
   shipSize: 18,
   shipRadius: 10,
-  thrustForce: 0.0008,
-  rotationSpeed: 0.05,
-  frictionAir: 0.008,
-  brakeFrictionAir: 0.06,
-  maxSpeed: 10,
-  maxBoostSpeed: 15,
-  wallRecoilForce: 0.004,
-  wallStunDuration: 180,
-  boostMaxMultiplier: 2.5,
-  boostRayLength: 40,
-  boostFadeRate: 0.04,
+
+  // Accelerations (Easily tunable)
+  thrustForce: 0.0012,
+  turnAcceleration: 0.0006,     // Extra acceleration applied while steering into turns
+  rotationSpeed: 0.055,
+  boostForce: 0.0025,            // Perpendicular/tangential force exerted by wall onto ship
+
+  frictionAir: 0.012,
+  brakeFrictionAir: 0.05,
+  maxSpeed: 8,
+  maxBoostSpeed: 16,
+
+  // Constant collision recoil
+  wallRecoilForce: 3.5,          // Constant rebound velocity magnitude away from wall regardless of impact speed
+  wallStunDuration: 220,
+
+  boostRayLength: 45,
+  boostFadeRate: 0.03,
   trailMaxLength: 80,
   trailFadeDuration: 500,
   cameraLerp: 0.08,

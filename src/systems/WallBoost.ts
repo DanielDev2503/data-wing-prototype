@@ -6,6 +6,8 @@ interface RayResult {
   hit: boolean;
   distance: number;
   normalizedDistance: number;
+  normalX: number;
+  normalY: number;
 }
 
 export class WallBoost {
@@ -41,10 +43,9 @@ export class WallBoost {
     this.drawRay(origins.left, endpoints.left, leftResult);
     this.drawRay(origins.right, endpoints.right, rightResult);
 
-    const bestProximity = Math.max(
-      leftResult.hit ? (1 - leftResult.normalizedDistance) : 0,
-      rightResult.hit ? (1 - rightResult.normalizedDistance) : 0
-    );
+    const leftProx = leftResult.hit ? (1 - leftResult.normalizedDistance) : 0;
+    const rightProx = rightResult.hit ? (1 - rightResult.normalizedDistance) : 0;
+    const bestProximity = Math.max(leftProx, rightProx);
 
     if (bestProximity > 0.05) {
       const alignmentFactor = this.computeAlignmentFactor();
@@ -55,6 +56,12 @@ export class WallBoost {
       if (targetBoost > currentBoost) {
         this.ship.setBoostLevel(Phaser.Math.Linear(currentBoost, targetBoost, 0.15));
       }
+
+      // Point 3: Physical tangential & perpendicular boost acceleration printed by the wall onto the ship
+      const activeResult = leftProx >= rightProx ? leftResult : rightResult;
+      if (activeResult.hit) {
+        this.applyWallBoostPhysics(activeResult.normalX, activeResult.normalY, boostValue);
+      }
     }
   }
 
@@ -62,9 +69,43 @@ export class WallBoost {
     this.debugGraphics.destroy();
   }
 
+  /**
+   * Applies the physical perpendicular/tangential boost acceleration printed by the wall onto the ship
+   */
+  private applyWallBoostPhysics(nx: number, ny: number, boostValue: number): void {
+    const shipAngle = this.ship.angle;
+    const fx = Math.cos(shipAngle);
+    const fy = Math.sin(shipAngle);
+
+    // Calculate component of forward vector along wall normal
+    const dot = fx * nx + fy * ny;
+
+    // Tangent vector along wall parallel to ship forward motion
+    let tx = fx - dot * nx;
+    let ty = fy - dot * ny;
+    const tLen = Math.sqrt(tx * tx + ty * ty);
+    if (tLen > 0.0001) {
+      tx /= tLen;
+      ty /= tLen;
+    } else {
+      tx = fx;
+      ty = fy;
+    }
+
+    // Perpendicular force: mostly tangential along wall surface + slight outward push to glide along wall
+    const wallForceMagnitude = GAME_CONFIG.boostForce * boostValue;
+    const boostForceX = (tx * 0.85 + nx * 0.15) * wallForceMagnitude;
+    const boostForceY = (ty * 0.85 + ny * 0.15) * wallForceMagnitude;
+
+    this.scene.matter.body.applyForce(this.ship.matterBody, this.ship.matterBody.position, {
+      x: boostForceX,
+      y: boostForceY,
+    });
+  }
+
   private castRayWithDistance(start: Phaser.Math.Vector2, end: Phaser.Math.Vector2): RayResult {
     if (this.wallBodies.length === 0) {
-      return { hit: false, distance: this.rayLength, normalizedDistance: 1 };
+      return { hit: false, distance: this.rayLength, normalizedDistance: 1, normalX: 0, normalY: 0 };
     }
 
     const collisions = this.scene.matter.query.ray(
@@ -74,14 +115,23 @@ export class WallBoost {
     );
 
     if (collisions.length === 0) {
-      return { hit: false, distance: this.rayLength, normalizedDistance: 1 };
+      return { hit: false, distance: this.rayLength, normalizedDistance: 1, normalX: 0, normalY: 0 };
     }
 
     let minDist = this.rayLength;
+    let hitNormalX = 0;
+    let hitNormalY = 0;
+
     for (const collision of collisions) {
-      const c = collision as unknown as { body?: MatterJS.BodyType; bodyA?: MatterJS.BodyType; point?: { x: number; y: number } };
+      const c = collision as unknown as {
+        body?: MatterJS.BodyType;
+        bodyA?: MatterJS.BodyType;
+        point?: { x: number; y: number };
+        normal?: { x: number; y: number };
+      };
       const targetBody = c.body || c.bodyA;
       let dist = this.rayLength;
+
       if (c.point) {
         const dx = c.point.x - start.x;
         const dy = c.point.y - start.y;
@@ -91,8 +141,19 @@ export class WallBoost {
         const dy = targetBody.position.y - start.y;
         dist = Math.sqrt(dx * dx + dy * dy);
       }
+
       if (dist < minDist) {
         minDist = dist;
+        if (c.normal) {
+          hitNormalX = c.normal.x;
+          hitNormalY = c.normal.y;
+        } else if (targetBody) {
+          const dx = start.x - targetBody.position.x;
+          const dy = start.y - targetBody.position.y;
+          const dLen = Math.sqrt(dx * dx + dy * dy) || 1;
+          hitNormalX = dx / dLen;
+          hitNormalY = dy / dLen;
+        }
       }
     }
 
@@ -100,6 +161,8 @@ export class WallBoost {
       hit: true,
       distance: minDist,
       normalizedDistance: Phaser.Math.Clamp(minDist / this.rayLength, 0, 1),
+      normalX: hitNormalX,
+      normalY: hitNormalY,
     };
   }
 

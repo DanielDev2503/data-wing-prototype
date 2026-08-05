@@ -24,7 +24,7 @@ export class PlayerShip {
     this.body = scene.matter.add.circle(x, y, GAME_CONFIG.shipRadius, {
       frictionAir: GAME_CONFIG.frictionAir,
       friction: 0.0,
-      restitution: 0.2,
+      restitution: 0.0,
       density: 0.001,
       label: "playerShip",
     });
@@ -73,6 +73,12 @@ export class PlayerShip {
     return leftDown && rightDown;
   }
 
+  get isTurning(): boolean {
+    const leftDown = this.cursors.left.isDown || this.keyA.isDown;
+    const rightDown = this.cursors.right.isDown || this.keyD.isDown;
+    return (leftDown || rightDown) && !this.isBraking;
+  }
+
   get isStunned(): boolean {
     return this.wallStunTimer > 0;
   }
@@ -91,6 +97,10 @@ export class PlayerShip {
     this.frozen = false;
   }
 
+  /**
+   * Constant wall collision recoil:
+   * Regardles of incoming speed or impact direction, set a fixed constant rebound velocity magnitude away from the wall.
+   */
   onWallCollision(_wallBody: MatterJS.BodyType, pair: MatterJS.IPair): void {
     this.wallStunTimer = GAME_CONFIG.wallStunDuration;
 
@@ -99,13 +109,28 @@ export class PlayerShip {
       bodyA?: MatterJS.BodyType;
     };
 
-    const normal = pairAny.collision?.normal || { x: 0, y: -1 };
-    const recoil = GAME_CONFIG.wallRecoilForce;
-    const sign = pairAny.bodyA === this.body ? -1 : 1;
+    let nx = pairAny.collision?.normal?.x ?? 0;
+    let ny = pairAny.collision?.normal?.y ?? -1;
 
-    this.scene.matter.body.applyForce(this.body, this.body.position, {
-      x: normal.x * recoil * sign,
-      y: normal.y * recoil * sign,
+    const len = Math.sqrt(nx * nx + ny * ny);
+    if (len > 0.0001) {
+      nx /= len;
+      ny /= len;
+    } else {
+      nx = 0;
+      ny = -1;
+    }
+
+    const sign = pairAny.bodyA === this.body ? -1 : 1;
+    const recoilNx = nx * sign;
+    const recoilNy = ny * sign;
+
+    // Fixed constant recoil velocity magnitude away from wall
+    const recoilSpeed = GAME_CONFIG.wallRecoilForce;
+
+    this.scene.matter.body.setVelocity(this.body, {
+      x: recoilNx * recoilSpeed,
+      y: recoilNy * recoilSpeed,
     });
   }
 
@@ -188,17 +213,21 @@ export class PlayerShip {
     }
   }
 
+  /**
+   * Configurable linear auto-acceleration + extra turning acceleration
+   */
   private handleAutoAcceleration(): void {
     if (this.isBraking || this.isStunned) return;
 
     const angle = this.body.angle;
     const baseForce = GAME_CONFIG.thrustForce;
-    const boostMult = 1 + this.boostLevel * (GAME_CONFIG.boostMaxMultiplier - 1);
-    const force = baseForce * boostMult;
+    const turnExtra = this.isTurning ? GAME_CONFIG.turnAcceleration : 0;
+
+    const totalLinearForce = baseForce + turnExtra;
 
     this.scene.matter.body.applyForce(this.body, this.body.position, {
-      x: Math.cos(angle) * force,
-      y: Math.sin(angle) * force,
+      x: Math.cos(angle) * totalLinearForce,
+      y: Math.sin(angle) * totalLinearForce,
     });
   }
 

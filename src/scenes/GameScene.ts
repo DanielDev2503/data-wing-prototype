@@ -82,16 +82,20 @@ export class GameScene extends Phaser.Scene {
   private zoneGraphics!: Phaser.GameObjects.Graphics;
   private bgGraphics!: Phaser.GameObjects.Graphics;
   private pauseOverlay!: Phaser.GameObjects.Graphics;
+  private completionOverlay!: Phaser.GameObjects.Graphics;
   private wallBodies: MatterJS.BodyType[] = [];
 
   private levelState: LevelState = LevelState.Waiting;
   private raceTimer: number = 0;
+  private finalRaceTime: number = 0;
   private timerText!: Phaser.GameObjects.Text;
   private stateText!: Phaser.GameObjects.Text;
   private speedText!: Phaser.GameObjects.Text;
   private boostBar!: Phaser.GameObjects.Graphics;
   private pauseText!: Phaser.GameObjects.Text;
+  private completionContainer!: Phaser.GameObjects.Container;
   private escKey!: Phaser.Input.Keyboard.Key;
+  private rKey!: Phaser.Input.Keyboard.Key;
 
   constructor() {
     super({ key: "GameScene" });
@@ -100,6 +104,7 @@ export class GameScene extends Phaser.Scene {
   create(): void {
     this.levelState = LevelState.Waiting;
     this.raceTimer = 0;
+    this.finalRaceTime = 0;
 
     this.buildBackground();
     this.buildOrganicCircuit();
@@ -118,6 +123,13 @@ export class GameScene extends Phaser.Scene {
     this.setupBloom();
     this.buildHUD();
     this.setupPause();
+    this.setupCompletionUI();
+
+    // Key shortcut R to restart anytime
+    this.rKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.R);
+    this.rKey.on("down", () => {
+      this.scene.restart();
+    });
   }
 
   update(_time: number, delta: number): void {
@@ -164,17 +176,15 @@ export class GameScene extends Phaser.Scene {
     this.wallGraphics = this.add.graphics();
     this.wallGraphics.setDepth(2);
 
-    // Build circuit using TrackBuilder
-    // Start at (600, 1800), heading UP (-Math.PI/2), track width = 280 (halfWidth = 140)
     const builder = new TrackBuilder(600, 1800, -Math.PI / 2, 140);
 
-    builder.straight(1000, 10);                // Goes UP from 1800 to 800 at X=600
-    builder.turn(400, Math.PI, 18);             // 180° right turn, ending at (1400, 800), heading DOWN
-    builder.straight(400, 6);                 // Goes DOWN from 800 to 1200 at X=1400
-    builder.turn(250, -Math.PI / 2, 12);        // 90° left turn, ending at (1650, 1450), heading RIGHT
-    builder.turn(250, Math.PI / 2, 12);         // 90° right turn, ending at (1900, 1700), heading DOWN
-    builder.straight(100, 2);                 // Goes DOWN from 1700 to 1800 at X=1900
-    builder.turn(650, Math.PI, 24);             // 180° right turn centered at (1250, 1800), ending back at (600, 1800), heading UP!
+    builder.straight(1000, 10);
+    builder.turn(400, Math.PI, 18);
+    builder.straight(400, 6);
+    builder.turn(250, -Math.PI / 2, 12);
+    builder.turn(250, Math.PI / 2, 12);
+    builder.straight(100, 2);
+    builder.turn(650, Math.PI, 24);
 
     const outerSegments = this.pointsToSegments(builder.outerPoints);
     const innerSegments = this.pointsToSegments(builder.innerPoints);
@@ -253,10 +263,7 @@ export class GameScene extends Phaser.Scene {
     this.zoneGraphics = this.add.graphics();
     this.zoneGraphics.setDepth(1);
 
-    // Start Zone across the main straight at Y=1600, X=600
     this.createZone(600, 1600, 275, 60, GAME_CONFIG.startZoneColor, "startZone");
-
-    // Finish Zone near the end of the loop at Y=1750, X=600
     this.createZone(600, 1750, 275, 60, GAME_CONFIG.finishZoneColor, "finishZone");
   }
 
@@ -315,7 +322,9 @@ export class GameScene extends Phaser.Scene {
 
       if (other.label === "finishZone" && this.levelState === LevelState.Playing) {
         this.levelState = LevelState.Completed;
+        this.finalRaceTime = this.raceTimer;
         this.ship.freeze();
+        this.showCompletionScreen();
       }
     });
   }
@@ -357,7 +366,7 @@ export class GameScene extends Phaser.Scene {
       ...hudStyle, fontSize: "20px", color: "#ff00ff",
     }).setDepth(100).setScrollFactor(0);
 
-    this.add.text(16, 42, "←→ / A-D Steer | A+D / ←+→ Brake | Hug walls for BOOST", {
+    this.add.text(16, 42, "←→/A-D Steer | A+D/←+→ Brake | R Restart | ESC Pause", {
       ...hudStyle, fontSize: "11px",
     }).setDepth(100).setScrollFactor(0);
 
@@ -401,6 +410,62 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
+  private setupCompletionUI(): void {
+    this.completionOverlay = this.add.graphics();
+    this.completionOverlay.setDepth(300);
+    this.completionOverlay.setScrollFactor(0);
+    this.completionOverlay.setVisible(false);
+
+    this.completionContainer = this.add.container(GAME_CONFIG.width / 2, GAME_CONFIG.height / 2);
+    this.completionContainer.setDepth(301);
+    this.completionContainer.setScrollFactor(0);
+    this.completionContainer.setVisible(false);
+  }
+
+  private showCompletionScreen(): void {
+    const formattedTime = this.formatTime(this.finalRaceTime);
+
+    this.completionOverlay.clear();
+    this.completionOverlay.fillStyle(0x000000, 0.82);
+    this.completionOverlay.fillRect(0, 0, GAME_CONFIG.width, GAME_CONFIG.height);
+    this.completionOverlay.setVisible(true);
+
+    this.completionContainer.removeAll(true);
+
+    const titleText = this.add.text(0, -90, "★ CIRCUIT COMPLETED ★", {
+      fontFamily: "'Courier New', monospace",
+      fontSize: "32px",
+      color: "#00ffff",
+      stroke: "#004444",
+      strokeThickness: 3,
+    }).setOrigin(0.5, 0.5);
+
+    const timeLabel = this.add.text(0, -20, "FINAL TIME", {
+      fontFamily: "'Courier New', monospace",
+      fontSize: "16px",
+      color: "#aaaaaa",
+    }).setOrigin(0.5, 0.5);
+
+    const timeValue = this.add.text(0, 20, formattedTime, {
+      fontFamily: "'Courier New', monospace",
+      fontSize: "46px",
+      color: "#ffff00",
+      stroke: "#444400",
+      strokeThickness: 4,
+    }).setOrigin(0.5, 0.5);
+
+    const restartHint = this.add.text(0, 90, "[ PRESS 'R' TO RESTART CIRCUIT ]", {
+      fontFamily: "'Courier New', monospace",
+      fontSize: "18px",
+      color: "#ff00ff",
+      stroke: "#330033",
+      strokeThickness: 2,
+    }).setOrigin(0.5, 0.5);
+
+    this.completionContainer.add([titleText, timeLabel, timeValue, restartHint]);
+    this.completionContainer.setVisible(true);
+  }
+
   private pauseGame(): void {
     this.levelState = LevelState.Paused;
     this.matter.world.pause();
@@ -422,18 +487,21 @@ export class GameScene extends Phaser.Scene {
     this.pauseText.setVisible(false);
   }
 
+  private formatTime(timeMs: number): string {
+    const totalMs = Math.floor(timeMs);
+    const minutes = Math.floor(totalMs / 60000);
+    const seconds = Math.floor((totalMs % 60000) / 1000);
+    const ms = totalMs % 1000;
+    return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
+  }
+
   private updateHUD(): void {
     const vel = this.ship.velocity;
     const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
     this.speedText.setText(`SPEED: ${(speed * 100).toFixed(0)}`);
 
-    const totalMs = Math.floor(this.raceTimer);
-    const minutes = Math.floor(totalMs / 60000);
-    const seconds = Math.floor((totalMs % 60000) / 1000);
-    const ms = totalMs % 1000;
-    this.timerText.setText(
-      `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`
-    );
+    const currentDisplayTime = this.levelState === LevelState.Completed ? this.finalRaceTime : this.raceTimer;
+    this.timerText.setText(this.formatTime(currentDisplayTime));
 
     switch (this.levelState) {
       case LevelState.Waiting:
@@ -445,9 +513,7 @@ export class GameScene extends Phaser.Scene {
         this.stateText.setVisible(false);
         break;
       case LevelState.Completed:
-        this.stateText.setText(`FINISHED! TIME: ${minutes}:${seconds.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`);
-        this.stateText.setColor("#ffff00");
-        this.stateText.setVisible(true);
+        this.stateText.setVisible(false);
         break;
       default:
         break;
