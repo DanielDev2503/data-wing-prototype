@@ -6,7 +6,7 @@ interface TrailPoint {
   x: number;
   y: number;
   age: number;
-  boosted: boolean;
+  boostLevel: number;
 }
 
 export class NeonTrail {
@@ -38,13 +38,13 @@ export class NeonTrail {
 
   private addPoint(): void {
     const backAngle = this.ship.angle + Math.PI;
-    const offset = GAME_CONFIG.shipSize * 0.5;
+    const offset = GAME_CONFIG.shipSize * 0.4;
 
     this.points.unshift({
       x: this.ship.x + Math.cos(backAngle) * offset,
       y: this.ship.y + Math.sin(backAngle) * offset,
       age: 0,
-      boosted: this.ship.isBoosting,
+      boostLevel: this.ship.currentBoostLevel,
     });
 
     if (this.points.length > this.maxPoints) {
@@ -75,8 +75,8 @@ export class NeonTrail {
 
       const lifeRatio = 1 - current.age / this.fadeDuration;
       const alpha = Math.max(0, lifeRatio * 0.8);
-      const thickness = Math.max(0.5, lifeRatio * 3);
-      const color = current.boosted ? GAME_CONFIG.boostColor : GAME_CONFIG.trailColor;
+      const thickness = Math.max(0.5, lifeRatio * (2 + current.boostLevel * 2));
+      const color = this.getTrailColor(current.boostLevel);
 
       this.graphics.lineStyle(thickness, color, alpha);
       this.graphics.beginPath();
@@ -87,9 +87,24 @@ export class NeonTrail {
 
     if (this.points.length > 0) {
       const head = this.points[0];
-      const headColor = head.boosted ? GAME_CONFIG.boostColor : GAME_CONFIG.trailColor;
+      const headColor = this.getTrailColor(head.boostLevel);
       this.graphics.fillStyle(headColor, 0.6);
-      this.graphics.fillCircle(head.x, head.y, 2);
+      this.graphics.fillCircle(head.x, head.y, 2 + head.boostLevel * 1.5);
     }
+  }
+
+  private getTrailColor(boostLevel: number): number {
+    if (boostLevel < 0.1) return GAME_CONFIG.trailColor;
+
+    const from = GAME_CONFIG.trailColor;
+    const to = GAME_CONFIG.boostColor;
+    const t = Phaser.Math.Clamp(boostLevel, 0, 1);
+
+    const fr = (from >> 16) & 0xff, fg = (from >> 8) & 0xff, fb = from & 0xff;
+    const tr = (to >> 16) & 0xff, tg = (to >> 8) & 0xff, tb = to & 0xff;
+    const r = Math.round(fr + (tr - fr) * t);
+    const g = Math.round(fg + (tg - fg) * t);
+    const b = Math.round(fb + (tb - fb) * t);
+    return (r << 16) | (g << 8) | b;
   }
 }
