@@ -91,6 +91,7 @@ export class GameScene extends Phaser.Scene {
   private timerText!: Phaser.GameObjects.Text;
   private stateText!: Phaser.GameObjects.Text;
   private speedText!: Phaser.GameObjects.Text;
+  private configText!: Phaser.GameObjects.Text;
   private boostBar!: Phaser.GameObjects.Graphics;
   private pauseText!: Phaser.GameObjects.Text;
   private completionContainer!: Phaser.GameObjects.Container;
@@ -380,6 +381,12 @@ export class GameScene extends Phaser.Scene {
 
     this.speedText = this.add.text(16, GAME_CONFIG.height - 30, "", hudStyle).setDepth(100).setScrollFactor(0);
 
+    this.configText = this.add.text(16, 68, "", {
+      ...hudStyle,
+      fontSize: "11px",
+      color: "#ff8800",
+    }).setDepth(100).setScrollFactor(0);
+
     this.boostBar = this.add.graphics();
     this.boostBar.setDepth(100);
     this.boostBar.setScrollFactor(0);
@@ -499,6 +506,19 @@ export class GameScene extends Phaser.Scene {
     const vel = this.ship.velocity;
     const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
     this.speedText.setText(`SPEED: ${(speed * 100).toFixed(0)}`);
+
+    this.configText.setText(
+      `[ CONFIG VARIABLES ]\n` +
+      `THRUST FORCE: ${GAME_CONFIG.thrustForce}\n` +
+      `BOOST FORCE: ${GAME_CONFIG.boostForce}\n` +
+      `BOOST PROXIMITY EXPONENT: ${GAME_CONFIG.boostProximityExponent}\n` +
+      `BOOST DECELERATION: ${GAME_CONFIG.boostDeceleration}\n` +
+      `BOOST RAY LENGTH: ${GAME_CONFIG.boostRayLength}\n` +
+      `BOOST RAY ANGLE: ${GAME_CONFIG.boostRayAngle}\n` +
+      `BOOST CENTER OFFSET: ${GAME_CONFIG.boostCenterOffset}\n` +
+      `WALL RECOIL FORCE: ${GAME_CONFIG.wallRecoilForce}\n` +
+      `WALL STUN DURATION: ${GAME_CONFIG.wallStunDuration}ms`
+    );
 
     const currentDisplayTime = this.levelState === LevelState.Completed ? this.finalRaceTime : this.raceTimer;
     this.timerText.setText(this.formatTime(currentDisplayTime));

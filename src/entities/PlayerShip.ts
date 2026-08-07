@@ -12,7 +12,10 @@ export class PlayerShip {
 
   private boostLevel: number = 0;
   private wallStunTimer: number = 0;
+  private stunSpeed: number = 0;
   private frozen: boolean = false;
+  private currentSpeedLimit: number = GAME_CONFIG.maxSpeed;
+  private pendingRecoilVelocity: { x: number; y: number } | null = null;
 
   constructor(scene: Phaser.Scene, x: number, y: number) {
     this.scene = scene;
@@ -28,6 +31,7 @@ export class PlayerShip {
       density: 0.001,
       label: "playerShip",
     });
+    scene.matter.body.setInertia(this.body, Infinity);
 
     this.cursors = scene.input.keyboard!.createCursorKeys();
     this.keyA = scene.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.A);
@@ -98,8 +102,10 @@ export class PlayerShip {
   }
 
   /**
-   * Constant wall collision recoil:
-   * Regardles of incoming speed or impact direction, set a fixed constant rebound velocity magnitude away from the wall.
+   * Wall collision handling:
+   * - Preserves ship facing direction
+   * - Suspends forward acceleration via wallStunTimer
+   * - Bounces off the wall reflecting velocity, preserving exact impact speed during the stun duration
    */
   onWallCollision(_wallBody: MatterJS.BodyType, pair: MatterJS.IPair): void {
     this.wallStunTimer = GAME_CONFIG.wallStunDuration;
@@ -125,13 +131,40 @@ export class PlayerShip {
     const recoilNx = nx * sign;
     const recoilNy = ny * sign;
 
-    // Fixed constant recoil velocity magnitude away from wall
-    const recoilSpeed = GAME_CONFIG.wallRecoilForce;
+    // 1. Lock facing angle: zero out angular velocity completely
+    const currentAngle = this.body.angle;
+    this.scene.matter.body.setAngularVelocity(this.body, 0);
+    this.scene.matter.body.setAngle(this.body, currentAngle);
 
-    this.scene.matter.body.setVelocity(this.body, {
-      x: recoilNx * recoilSpeed,
-      y: recoilNy * recoilSpeed,
-    });
+    // 2. Measure impact speed (preserving exact speed at impact, minimum wallRecoilForce)
+    const impactSpeed = Math.max(this.speed, GAME_CONFIG.wallRecoilForce);
+    this.stunSpeed = impactSpeed;
+
+    // 3. Reflect current velocity vector off wall normal to create natural bounce
+    const vx = this.body.velocity.x;
+    const vy = this.body.velocity.y;
+    const dot = vx * recoilNx + vy * recoilNy;
+
+    let rx: number;
+    let ry: number;
+    if (dot < 0) {
+      // Reflection vector: v - 2*(v . n)*n
+      rx = vx - 2 * dot * recoilNx;
+      ry = vy - 2 * dot * recoilNy;
+      const rLen = Math.sqrt(rx * rx + ry * ry);
+      if (rLen > 0.0001) {
+        rx = (rx / rLen) * impactSpeed;
+        ry = (ry / rLen) * impactSpeed;
+      } else {
+        rx = recoilNx * impactSpeed;
+        ry = recoilNy * impactSpeed;
+      }
+    } else {
+      rx = recoilNx * impactSpeed;
+      ry = recoilNy * impactSpeed;
+    }
+
+    this.pendingRecoilVelocity = { x: rx, y: ry };
   }
 
   update(delta: number): void {
@@ -140,18 +173,31 @@ export class PlayerShip {
       return;
     }
 
+    if (this.pendingRecoilVelocity) {
+      this.scene.matter.body.setVelocity(this.body, this.pendingRecoilVelocity);
+      this.pendingRecoilVelocity = null;
+    }
+
     this.updateStun(delta);
     this.handleRotation();
     this.handleAutoAcceleration();
-    this.handleBraking();
     this.decayBoost();
-    this.clampSpeed();
+    this.clampSpeed(delta);
     this.drawShip();
+  }
+
+  getBackCenter(offsetFactor: number = GAME_CONFIG.boostCenterOffset): Phaser.Math.Vector2 {
+    const backAngle = this.body.angle + Math.PI;
+    const offset = this.size * offsetFactor;
+    return new Phaser.Math.Vector2(
+      this.body.position.x + Math.cos(backAngle) * offset,
+      this.body.position.y + Math.sin(backAngle) * offset
+    );
   }
 
   getBackRayOrigins(): { left: Phaser.Math.Vector2; right: Phaser.Math.Vector2 } {
     const backAngle = this.body.angle + Math.PI;
-    const spread = 0.6;
+    const spread = GAME_CONFIG.boostRayAngle;
     const offset = this.size * 0.5;
 
     return {
@@ -169,7 +215,7 @@ export class PlayerShip {
   getBackRayEndpoints(rayLength: number): { left: Phaser.Math.Vector2; right: Phaser.Math.Vector2 } {
     const origins = this.getBackRayOrigins();
     const backAngle = this.body.angle + Math.PI;
-    const spread = 0.6;
+    const spread = GAME_CONFIG.boostRayAngle;
 
     return {
       left: new Phaser.Math.Vector2(
@@ -196,7 +242,7 @@ export class PlayerShip {
 
   private handleRotation(): void {
     if (this.isBraking) {
-      this.scene.matter.body.setAngularVelocity(this.body, this.body.angularVelocity * 0.8);
+      this.scene.matter.body.setAngularVelocity(this.body, 0);
       return;
     }
 
@@ -209,36 +255,22 @@ export class PlayerShip {
     } else if (rightDown) {
       this.scene.matter.body.setAngularVelocity(this.body, rotSpeed);
     } else {
-      this.scene.matter.body.setAngularVelocity(this.body, this.body.angularVelocity * 0.88);
+      this.scene.matter.body.setAngularVelocity(this.body, 0);
     }
   }
 
   /**
-   * Configurable linear auto-acceleration + extra turning acceleration
+   * Configurable linear auto-acceleration
    */
   private handleAutoAcceleration(): void {
     if (this.isBraking || this.isStunned) return;
 
     const angle = this.body.angle;
     const baseForce = GAME_CONFIG.thrustForce;
-    const turnExtra = this.isTurning ? GAME_CONFIG.turnAcceleration : 0;
-
-    const totalLinearForce = baseForce + turnExtra;
 
     this.scene.matter.body.applyForce(this.body, this.body.position, {
-      x: Math.cos(angle) * totalLinearForce,
-      y: Math.sin(angle) * totalLinearForce,
-    });
-  }
-
-  private handleBraking(): void {
-    if (!this.isBraking) return;
-
-    const vel = this.body.velocity;
-    const brakeFactor = GAME_CONFIG.brakeFrictionAir;
-    this.scene.matter.body.setVelocity(this.body, {
-      x: vel.x * (1 - brakeFactor),
-      y: vel.y * (1 - brakeFactor),
+      x: Math.cos(angle) * baseForce,
+      y: Math.sin(angle) * baseForce,
     });
   }
 
@@ -248,12 +280,32 @@ export class PlayerShip {
     }
   }
 
-  private clampSpeed(): void {
-    const limit = this.isBoosting ? GAME_CONFIG.maxBoostSpeed : GAME_CONFIG.maxSpeed;
+  private clampSpeed(delta: number): void {
+    if (this.isStunned) {
+      const v = this.body.velocity;
+      const spd = Math.sqrt(v.x * v.x + v.y * v.y);
+      if (spd > 0.0001 && this.stunSpeed > 0) {
+        const scale = this.stunSpeed / spd;
+        this.scene.matter.body.setVelocity(this.body, {
+          x: v.x * scale,
+          y: v.y * scale,
+        });
+      }
+      return;
+    }
+
+    // Smoothly interpolate speed limit upwards while boosting, and decelerate smoothly when leaving boost
+    if (this.isBoosting) {
+      this.currentSpeedLimit = Phaser.Math.Linear(this.currentSpeedLimit, GAME_CONFIG.maxBoostSpeed, 0.1);
+    } else {
+      const decayStep = GAME_CONFIG.boostDeceleration * (delta / 16.66);
+      this.currentSpeedLimit = Math.max(GAME_CONFIG.maxSpeed, this.currentSpeedLimit - decayStep);
+    }
+
     const vel = this.body.velocity;
     const spd = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
-    if (spd > limit) {
-      const scale = limit / spd;
+    if (spd > this.currentSpeedLimit) {
+      const scale = this.currentSpeedLimit / spd;
       this.scene.matter.body.setVelocity(this.body, {
         x: vel.x * scale,
         y: vel.y * scale,

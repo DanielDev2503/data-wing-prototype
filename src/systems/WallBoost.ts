@@ -34,22 +34,48 @@ export class WallBoost {
 
     if (this.ship.isBraking || this.ship.isStunned) return;
 
-    const origins = this.ship.getBackRayOrigins();
-    const endpoints = this.ship.getBackRayEndpoints(this.rayLength);
+    const center = this.ship.getBackCenter();
+    const backAngle = this.ship.angle + Math.PI;
+    const spread = GAME_CONFIG.boostRayAngle;
+    const numRays = 15;
 
-    const leftResult = this.castRayWithDistance(origins.left, endpoints.left);
-    const rightResult = this.castRayWithDistance(origins.right, endpoints.right);
+    let closestResult: RayResult = {
+      hit: false,
+      distance: this.rayLength,
+      normalizedDistance: 1,
+      normalX: 0,
+      normalY: 0,
+    };
 
-    this.drawRay(origins.left, endpoints.left, leftResult);
-    this.drawRay(origins.right, endpoints.right, rightResult);
+    const rayResults: { start: Phaser.Math.Vector2; end: Phaser.Math.Vector2; result: RayResult }[] = [];
 
-    const leftProx = leftResult.hit ? (1 - leftResult.normalizedDistance) : 0;
-    const rightProx = rightResult.hit ? (1 - rightResult.normalizedDistance) : 0;
-    const bestProximity = Math.max(leftProx, rightProx);
+    for (let i = 0; i < numRays; i++) {
+      const t = numRays > 1 ? i / (numRays - 1) : 0.5;
+      const rayAngle = backAngle - spread + t * (2 * spread);
 
-    if (bestProximity > 0.05) {
+      const end = new Phaser.Math.Vector2(
+        center.x + Math.cos(rayAngle) * this.rayLength,
+        center.y + Math.sin(rayAngle) * this.rayLength
+      );
+
+      const result = this.castRayWithDistance(center, end);
+      rayResults.push({ start: center, end, result });
+
+      if (result.hit && result.distance < closestResult.distance) {
+        closestResult = result;
+      }
+    }
+
+    const bestProximity = closestResult.hit ? (1 - closestResult.normalizedDistance) : 0;
+
+    // Draw the semicircle / sector detection zone delimited by boostRayAngle
+    this.drawSemicircleZone(center, backAngle, spread, bestProximity, rayResults);
+
+    if (bestProximity > 0.05 && closestResult.hit) {
       const alignmentFactor = this.computeAlignmentFactor();
-      const boostValue = bestProximity * alignmentFactor;
+      // Boost becomes exponentially stronger as the rays get closer to the wall
+      const proximityFactor = Math.pow(bestProximity, GAME_CONFIG.boostProximityExponent);
+      const boostValue = proximityFactor * alignmentFactor;
       const currentBoost = this.ship.currentBoostLevel;
       const targetBoost = Phaser.Math.Clamp(boostValue, 0, 1);
 
@@ -57,11 +83,10 @@ export class WallBoost {
         this.ship.setBoostLevel(Phaser.Math.Linear(currentBoost, targetBoost, 0.15));
       }
 
-      // Point 3: Physical tangential & perpendicular boost acceleration printed by the wall onto the ship
-      const activeResult = leftProx >= rightProx ? leftResult : rightResult;
-      if (activeResult.hit) {
-        this.applyWallBoostPhysics(activeResult.normalX, activeResult.normalY, boostValue);
-      }
+      this.applyWallBoostPhysics(closestResult.normalX, closestResult.normalY, boostValue);
+    } else {
+      // Immediately stop boost when rays are not in contact with a wall
+      this.ship.setBoostLevel(0);
     }
   }
 
@@ -180,22 +205,54 @@ export class WallBoost {
     return Phaser.Math.Clamp(alignment, 0.1, 1);
   }
 
-  private drawRay(start: Phaser.Math.Vector2, end: Phaser.Math.Vector2, result: RayResult): void {
-    const intensity = result.hit ? (1 - result.normalizedDistance) : 0;
-    const color = result.hit
-      ? this.lerpColor(0x333333, GAME_CONFIG.boostColor, intensity)
-      : 0x222222;
-    const alpha = result.hit ? 0.3 + intensity * 0.5 : 0.1;
+  private drawSemicircleZone(
+    center: Phaser.Math.Vector2,
+    backAngle: number,
+    spread: number,
+    bestProximity: number,
+    rayResults: { start: Phaser.Math.Vector2; end: Phaser.Math.Vector2; result: RayResult }[]
+  ): void {
+    const startAngle = backAngle - spread;
+    const endAngle = backAngle + spread;
 
-    this.debugGraphics.lineStyle(1, color, alpha);
+    // Fill sector area with boost glow color scaled by proximity
+    const fillAlpha = bestProximity > 0 ? 0.08 + bestProximity * 0.45 : 0.04;
+    this.debugGraphics.fillStyle(GAME_CONFIG.boostColor, fillAlpha);
     this.debugGraphics.beginPath();
-    this.debugGraphics.moveTo(start.x, start.y);
-    this.debugGraphics.lineTo(end.x, end.y);
+    this.debugGraphics.moveTo(center.x, center.y);
+    this.debugGraphics.arc(center.x, center.y, this.rayLength, startAngle, endAngle, false);
+    this.debugGraphics.closePath();
+    this.debugGraphics.fillPath();
+
+    // Stroke boundary outline of the sector
+    const strokeColor = bestProximity > 0
+      ? this.lerpColor(0x555555, GAME_CONFIG.boostColor, bestProximity)
+      : 0x333333;
+    const strokeAlpha = bestProximity > 0 ? 0.4 + bestProximity * 0.5 : 0.2;
+    this.debugGraphics.lineStyle(1.5, strokeColor, strokeAlpha);
+    this.debugGraphics.beginPath();
+    this.debugGraphics.moveTo(center.x, center.y);
+    this.debugGraphics.arc(center.x, center.y, this.rayLength, startAngle, endAngle, false);
+    this.debugGraphics.closePath();
     this.debugGraphics.strokePath();
 
-    if (result.hit && intensity > 0.3) {
-      this.debugGraphics.fillStyle(GAME_CONFIG.boostColor, intensity * 0.8);
-      this.debugGraphics.fillCircle(start.x, start.y, 2 + intensity * 2);
+    // Draw individual ray hits within sector
+    for (const item of rayResults) {
+      if (item.result.hit) {
+        const prox = 1 - item.result.normalizedDistance;
+        const rayDirAngle = Math.atan2(item.end.y - center.y, item.end.x - center.x);
+        const hitX = center.x + Math.cos(rayDirAngle) * item.result.distance;
+        const hitY = center.y + Math.sin(rayDirAngle) * item.result.distance;
+
+        this.debugGraphics.lineStyle(1, GAME_CONFIG.boostColor, 0.2 + prox * 0.5);
+        this.debugGraphics.beginPath();
+        this.debugGraphics.moveTo(center.x, center.y);
+        this.debugGraphics.lineTo(hitX, hitY);
+        this.debugGraphics.strokePath();
+
+        this.debugGraphics.fillStyle(GAME_CONFIG.boostColor, 0.5 + prox * 0.5);
+        this.debugGraphics.fillCircle(hitX, hitY, 1.5 + prox * 2);
+      }
     }
   }
 

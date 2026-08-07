@@ -8,23 +8,26 @@ export interface GameConfig {
   readonly shipSize: number;
   readonly shipRadius: number;
 
-  // Modifiable accelerations
-  readonly thrustForce: number;          // Base forward auto-acceleration
-  readonly turnAcceleration: number;     // Configurable extra acceleration applied when turning
-  readonly rotationSpeed: number;        // Angular turning speed
-  readonly boostForce: number;           // Tangential/perpendicular boost force printed by wall onto ship
+  // Modifiable accelerations & control
+  readonly thrustForce: number;          // Base forward auto-acceleration force
+  readonly rotationSpeed: number;        // Angular turning speed (rad/frame)
+  readonly boostForce: number;           // Boost force magnitude applied when gliding near walls
 
   readonly frictionAir: number;
-  readonly brakeFrictionAir: number;
   readonly maxSpeed: number;
   readonly maxBoostSpeed: number;
 
-  // Collision recoil
-  readonly wallRecoilForce: number;      // Constant recoil impulse magnitude on collision regardless of impact speed/direction
-  readonly wallStunDuration: number;
+  // Collision recoil & bounce
+  readonly wallRecoilForce: number;      // Constant rebound velocity magnitude applied perpendicular from wall
+  readonly wallStunDuration: number;     // Time in ms forward auto-acceleration is suspended after hit
 
-  readonly boostRayLength: number;
-  readonly boostFadeRate: number;
+  // Boost ray & proximity settings
+  readonly boostRayLength: number;       // Length of the detection rays / radius of semicircle zone
+  readonly boostRayAngle: number;        // Half-width angle spread of the boost rays / semicircle sector (radians)
+  readonly boostCenterOffset: number;    // Offset factor along ship's longitudinal axis for the boost circle center (0.5 = back center, 0 = ship center, etc.)
+  readonly boostProximityExponent: number; // Exponent for proximity scaling (higher = much stronger when closer to wall)
+  readonly boostFadeRate: number;        // Rate at which boost level decays
+  readonly boostDeceleration: number;   // Smooth speed deceleration rate when exiting boost zone
   readonly trailMaxLength: number;
   readonly trailFadeDuration: number;
   readonly cameraLerp: number;
@@ -43,30 +46,32 @@ export const GAME_CONFIG: GameConfig = {
   height: 720,
   worldWidth: 4000,
   worldHeight: 3000,
-  shipSize: 18,
-  shipRadius: 10,
+  shipSize: 5,
+  shipRadius: 3,
 
   // Accelerations (Easily tunable)
-  thrustForce: 0.0012,
-  turnAcceleration: 0.0006,     // Extra acceleration applied while steering into turns
-  rotationSpeed: 0.055,
-  boostForce: 0.0025,            // Perpendicular/tangential force exerted by wall onto ship
+  thrustForce: 0.00001,
+  rotationSpeed: 0.06,
+  boostForce: 0.00005,            // Perpendicular/tangential force exerted by wall onto ship
 
-  frictionAir: 0.012,
-  brakeFrictionAir: 0.05,
-  maxSpeed: 8,
-  maxBoostSpeed: 16,
+  frictionAir: 0.001,
+  maxSpeed: 4,
+  maxBoostSpeed: 12,
 
   // Constant collision recoil
-  wallRecoilForce: 3.5,          // Constant rebound velocity magnitude away from wall regardless of impact speed
-  wallStunDuration: 220,
+  wallRecoilForce: 5,          // Constant rebound velocity magnitude away from wall regardless of impact speed
+  wallStunDuration: 1000,
 
-  boostRayLength: 45,
-  boostFadeRate: 0.03,
+  boostRayLength: 60,
+  boostRayAngle: 0.75,
+  boostCenterOffset: 0,           // Offset factor along ship's longitudinal axis for boost circle center (e.g. 0.5 = back, 0 = center, -0.5 = front)
+  boostProximityExponent: 0,   // Exponent ramping up boost power as rays get closer to wall (e.g. 1.0=linear, 2.0=quadratic)
+  boostFadeRate: 0,
+  boostDeceleration: 0.15,     // Smooth speed deceleration rate when leaving boost (prevents instant abrupt stop)
   trailMaxLength: 80,
   trailFadeDuration: 500,
   cameraLerp: 0.08,
-  cameraZoom: 1.3,
+  cameraZoom: 1,
   wallColor: 0x00ffff,
   shipColor: 0xff00ff,
   boostColor: 0xffff00,
