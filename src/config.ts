@@ -13,21 +13,22 @@ export interface GameConfig {
   readonly rotationSpeed: number;        // Angular turning speed (rad/frame)
   readonly boostForce: number;           // Boost force magnitude applied when gliding near walls
 
-  readonly frictionAir: number;
-  readonly maxSpeed: number;
-  readonly maxBoostSpeed: number;
+  readonly frictionAir: number;          // Base air friction
+  readonly brakeFrictionAir: number;     // Air friction when dual braking
+  readonly maxSpeed: number;             // Base cruising speed cap
+  readonly maxBoostSpeed: number;        // Peak speed cap during max wall boost
 
   // Collision recoil & bounce
-  readonly wallRecoilForce: number;      // Constant rebound velocity magnitude applied perpendicular from wall
-  readonly wallStunDuration: number;     // Time in ms forward auto-acceleration is suspended after hit
+  readonly wallRecoilForce: number;      // Rebound speed magnitude applied away from wall
+  readonly wallStunDuration: number;     // Time in ms forward auto-acceleration is suspended after hit (0.35s = 350ms)
 
   // Boost ray & proximity settings
-  readonly boostRayLength: number;       // Length of the detection rays / radius of semicircle zone
-  readonly boostRayAngle: number;        // Half-width angle spread of the boost rays / semicircle sector (radians)
-  readonly boostCenterOffset: number;    // Offset factor along ship's longitudinal axis for the boost circle center (0.5 = back center, 0 = ship center, etc.)
-  readonly boostProximityExponent: number; // Exponent for proximity scaling (higher = much stronger when closer to wall)
-  readonly boostFadeRate: number;        // Rate at which boost level decays
-  readonly boostDeceleration: number;   // Smooth speed deceleration rate when exiting boost zone
+  readonly boostProximityRadius: number; // Proximity threshold (r_prox) for wall-grazing boost
+  readonly boostProximityExponent: number; // Exponent for proximity scaling
+  readonly boostDeceleration: number;   // Smooth speed deceleration rate when leaving boost
+  readonly boostLerpSpeed: number;       // Interpolation speed for boost ramp-up/down
+
+  // Trail & visuals
   readonly trailMaxLength: number;
   readonly trailFadeDuration: number;
   readonly cameraLerp: number;
@@ -36,6 +37,7 @@ export interface GameConfig {
   readonly shipColor: number;
   readonly boostColor: number;
   readonly trailColor: number;
+  readonly trailBoostColor: number;
   readonly startZoneColor: number;
   readonly finishZoneColor: number;
   readonly bloomStrength: number;
@@ -44,41 +46,45 @@ export interface GameConfig {
 export const GAME_CONFIG: GameConfig = {
   width: 1280,
   height: 720,
-  worldWidth: 4000,
-  worldHeight: 3000,
-  shipSize: 5,
-  shipRadius: 3,
+  worldWidth: 4200,
+  worldHeight: 3200,
+  shipSize: 14,
+  shipRadius: 7,
 
-  // Accelerations (Easily tunable)
-  thrustForce: 0.00001,
-  rotationSpeed: 0.06,
-  boostForce: 0.00005,            // Perpendicular/tangential force exerted by wall onto ship
+  // Accelerations calibrated for responsive high-speed Game Feel
+  thrustForce: 0.00065,
+  rotationSpeed: 0.062,
+  boostForce: 0.0016,
 
-  frictionAir: 0.001,
-  maxSpeed: 4,
-  maxBoostSpeed: 12,
+  frictionAir: 0.02,
+  brakeFrictionAir: 0.15,
+  maxSpeed: 7.0,
+  maxBoostSpeed: 14.5,
 
-  // Constant collision recoil
-  wallRecoilForce: 5,          // Constant rebound velocity magnitude away from wall regardless of impact speed
-  wallStunDuration: 1000,
+  // Frontal impact stun & elastic bounce (0.35s = 350ms)
+  wallRecoilForce: 4.8,
+  wallStunDuration: 350,
 
-  boostRayLength: 60,
-  boostRayAngle: 0.75,
-  boostCenterOffset: 0,           // Offset factor along ship's longitudinal axis for boost circle center (e.g. 0.5 = back, 0 = center, -0.5 = front)
-  boostProximityExponent: 0,   // Exponent ramping up boost power as rays get closer to wall (e.g. 1.0=linear, 2.0=quadratic)
-  boostFadeRate: 0,
-  boostDeceleration: 0.15,     // Smooth speed deceleration rate when leaving boost (prevents instant abrupt stop)
-  trailMaxLength: 80,
-  trailFadeDuration: 500,
+  // Wall-boost proximity settings
+  boostProximityRadius: 65,
+  boostProximityExponent: 1.0,
+  boostDeceleration: 0.18,
+  boostLerpSpeed: 0.14,
+
+  // Visuals & aesthetics
+  trailMaxLength: 100,
+  trailFadeDuration: 550,
   cameraLerp: 0.08,
-  cameraZoom: 1,
-  wallColor: 0x00ffff,
-  shipColor: 0xff00ff,
-  boostColor: 0xffff00,
-  trailColor: 0xff00ff,
+  cameraZoom: 1.0,
+
+  wallColor: 0x00f0ff,
+  shipColor: 0x00e5ff,
+  boostColor: 0xff007f,
+  trailColor: 0x00d4ff,
+  trailBoostColor: 0xff007f,
   startZoneColor: 0x00ff88,
-  finishZoneColor: 0xff4444,
-  bloomStrength: 1.5,
+  finishZoneColor: 0xff2255,
+  bloomStrength: 1.4,
 };
 
 export enum LevelState {
@@ -93,12 +99,18 @@ export function createPhaserConfig(scene: typeof Phaser.Scene): Phaser.Types.Cor
     type: Phaser.WEBGL,
     width: GAME_CONFIG.width,
     height: GAME_CONFIG.height,
-    backgroundColor: "#000000",
+    backgroundColor: "#030308",
     parent: document.body,
     physics: {
       default: "matter",
       matter: {
         gravity: { x: 0, y: 0 },
+        runner: {
+          fps: 60,
+          delta: 1000 / 60,
+          isFixed: true,
+        } as Phaser.Types.Physics.Matter.MatterRunnerConfig & { isFixed?: boolean },
+        autoUpdate: true,
         debug: false,
       },
     },

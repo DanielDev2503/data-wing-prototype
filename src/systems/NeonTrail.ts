@@ -2,33 +2,40 @@ import Phaser from "phaser";
 import { GAME_CONFIG } from "../config";
 import { PlayerShip } from "../entities/PlayerShip";
 
-interface TrailPoint {
+interface TrailNode {
   x: number;
   y: number;
-  age: number;
-  boostLevel: number;
+  boost: number;
 }
 
 export class NeonTrail {
   private readonly ship: PlayerShip;
   private readonly graphics: Phaser.GameObjects.Graphics;
-  private readonly points: TrailPoint[] = [];
   private readonly maxPoints: number;
-  private readonly fadeDuration: number;
+  private readonly ringBuffer: TrailNode[];
+
+  private headIndex: number = 0;
+  private count: number = 0;
+
+  // Scratch position to eliminate GC
+  private readonly scratchPos = { x: 0, y: 0 };
 
   constructor(scene: Phaser.Scene, ship: PlayerShip) {
     this.ship = ship;
     this.maxPoints = GAME_CONFIG.trailMaxLength;
-    this.fadeDuration = GAME_CONFIG.trailFadeDuration;
 
     this.graphics = scene.add.graphics();
     this.graphics.setDepth(3);
+
+    // Preallocate all circular buffer nodes once
+    this.ringBuffer = new Array<TrailNode>(this.maxPoints);
+    for (let i = 0; i < this.maxPoints; i++) {
+      this.ringBuffer[i] = { x: 0, y: 0, boost: 0 };
+    }
   }
 
-  update(delta: number): void {
+  update(_delta: number): void {
     this.addPoint();
-    this.agePoints(delta);
-    this.prunePoints();
     this.draw();
   }
 
@@ -37,74 +44,74 @@ export class NeonTrail {
   }
 
   private addPoint(): void {
-    const backAngle = this.ship.angle + Math.PI;
-    const offset = GAME_CONFIG.shipSize * 0.4;
+    this.ship.getTailPosition(this.scratchPos);
 
-    this.points.unshift({
-      x: this.ship.x + Math.cos(backAngle) * offset,
-      y: this.ship.y + Math.sin(backAngle) * offset,
-      age: 0,
-      boostLevel: this.ship.currentBoostLevel,
-    });
+    const node = this.ringBuffer[this.headIndex];
+    node.x = this.scratchPos.x;
+    node.y = this.scratchPos.y;
+    node.boost = this.ship.currentBoostLevel;
 
-    if (this.points.length > this.maxPoints) {
-      this.points.pop();
-    }
-  }
-
-  private agePoints(delta: number): void {
-    for (const point of this.points) {
-      point.age += delta;
-    }
-  }
-
-  private prunePoints(): void {
-    while (this.points.length > 0 && this.points[this.points.length - 1].age > this.fadeDuration) {
-      this.points.pop();
+    this.headIndex = (this.headIndex + 1) % this.maxPoints;
+    if (this.count < this.maxPoints) {
+      this.count++;
     }
   }
 
   private draw(): void {
     this.graphics.clear();
 
-    if (this.points.length < 2) return;
+    if (this.count < 2) return;
 
-    for (let i = 0; i < this.points.length - 1; i++) {
-      const current = this.points[i];
-      const next = this.points[i + 1];
+    const baseColor = GAME_CONFIG.trailColor;
+    const boostColor = GAME_CONFIG.trailBoostColor;
 
-      const lifeRatio = 1 - current.age / this.fadeDuration;
-      const alpha = Math.max(0, lifeRatio * 0.8);
-      const thickness = Math.max(0.5, lifeRatio * (2 + current.boostLevel * 2));
-      const color = this.getTrailColor(current.boostLevel);
+    for (let i = 0; i < this.count - 1; i++) {
+      const idxCurr = (this.headIndex - 1 - i + this.maxPoints) % this.maxPoints;
+      const idxNext = (this.headIndex - 2 - i + this.maxPoints) % this.maxPoints;
+
+      const curr = this.ringBuffer[idxCurr];
+      const next = this.ringBuffer[idxNext];
+
+      const lifeRatio = 1 - (i / this.count);
+      const alpha = Math.max(0, lifeRatio * 0.85);
+
+      // Modulate thickness: tapered towards tail, wider at base with higher boost
+      const thickness = Math.max(0.6, lifeRatio * (2.2 + curr.boost * 3.6));
+
+      // Dynamic color interpolation from cyan to hot magenta
+      const color = curr.boost > 0.05
+        ? this.fastLerpColor(baseColor, boostColor, curr.boost)
+        : baseColor;
 
       this.graphics.lineStyle(thickness, color, alpha);
       this.graphics.beginPath();
-      this.graphics.moveTo(current.x, current.y);
+      this.graphics.moveTo(curr.x, curr.y);
       this.graphics.lineTo(next.x, next.y);
       this.graphics.strokePath();
     }
 
-    if (this.points.length > 0) {
-      const head = this.points[0];
-      const headColor = this.getTrailColor(head.boostLevel);
-      this.graphics.fillStyle(headColor, 0.6);
-      this.graphics.fillCircle(head.x, head.y, 2 + head.boostLevel * 1.5);
-    }
+    // Glowing core emitter at the head
+    const latestIdx = (this.headIndex - 1 + this.maxPoints) % this.maxPoints;
+    const head = this.ringBuffer[latestIdx];
+    const headBoost = head.boost;
+    const headColor = headBoost > 0.05
+      ? this.fastLerpColor(baseColor, boostColor, headBoost)
+      : baseColor;
+
+    this.graphics.fillStyle(headColor, 0.7 + headBoost * 0.3);
+    this.graphics.fillCircle(head.x, head.y, 2.5 + headBoost * 2.0);
+
+    this.graphics.fillStyle(0xffffff, 0.85);
+    this.graphics.fillCircle(head.x, head.y, 1.2 + headBoost * 1.0);
   }
 
-  private getTrailColor(boostLevel: number): number {
-    if (boostLevel < 0.1) return GAME_CONFIG.trailColor;
-
-    const from = GAME_CONFIG.trailColor;
-    const to = GAME_CONFIG.boostColor;
-    const t = Phaser.Math.Clamp(boostLevel, 0, 1);
-
+  private fastLerpColor(from: number, to: number, t: number): number {
+    const clampedT = t > 1 ? 1 : (t < 0 ? 0 : t);
     const fr = (from >> 16) & 0xff, fg = (from >> 8) & 0xff, fb = from & 0xff;
     const tr = (to >> 16) & 0xff, tg = (to >> 8) & 0xff, tb = to & 0xff;
-    const r = Math.round(fr + (tr - fr) * t);
-    const g = Math.round(fg + (tg - fg) * t);
-    const b = Math.round(fb + (tb - fb) * t);
+    const r = Math.round(fr + (tr - fr) * clampedT);
+    const g = Math.round(fg + (tg - fg) * clampedT);
+    const b = Math.round(fb + (tb - fb) * clampedT);
     return (r << 16) | (g << 8) | b;
   }
 }

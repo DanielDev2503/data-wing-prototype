@@ -12,10 +12,22 @@ export class PlayerShip {
 
   private boostLevel: number = 0;
   private wallStunTimer: number = 0;
-  private stunSpeed: number = 0;
   private frozen: boolean = false;
   private currentSpeedLimit: number = GAME_CONFIG.maxSpeed;
-  private pendingRecoilVelocity: { x: number; y: number } | null = null;
+
+  // Zero-GC preallocated reusable structs
+  private readonly scratchForce = { x: 0, y: 0 };
+  private readonly scratchVelocity = { x: 0, y: 0 };
+
+  // Preallocated vertex coordinates for rendering
+  private noseX: number = 0;
+  private noseY: number = 0;
+  private leftWingX: number = 0;
+  private leftWingY: number = 0;
+  private rightWingX: number = 0;
+  private rightWingY: number = 0;
+  private innerCenterX: number = 0;
+  private innerCenterY: number = 0;
 
   constructor(scene: Phaser.Scene, x: number, y: number) {
     this.scene = scene;
@@ -24,13 +36,16 @@ export class PlayerShip {
     this.graphics = scene.add.graphics();
     this.graphics.setDepth(10);
 
+    // Decoupled circular hitbox with zero friction, baseline frictionAir and restitution
     this.body = scene.matter.add.circle(x, y, GAME_CONFIG.shipRadius, {
-      frictionAir: GAME_CONFIG.frictionAir,
       friction: 0.0,
-      restitution: 0.0,
+      frictionAir: GAME_CONFIG.frictionAir,
+      restitution: 0.2,
       density: 0.001,
       label: "playerShip",
     });
+
+    // Lock inertia so collisions do not induce wild physics angular spin
     scene.matter.body.setInertia(this.body, Infinity);
 
     this.cursors = scene.input.keyboard!.createCursorKeys();
@@ -55,8 +70,9 @@ export class PlayerShip {
   }
 
   get speed(): number {
-    const v = this.body.velocity;
-    return Math.sqrt(v.x * v.x + v.y * v.y);
+    const vx = this.body.velocity.x;
+    const vy = this.body.velocity.y;
+    return Math.sqrt(vx * vx + vy * vy);
   }
 
   get matterBody(): MatterJS.BodyType {
@@ -68,7 +84,7 @@ export class PlayerShip {
   }
 
   get isBoosting(): boolean {
-    return this.boostLevel > 0.1;
+    return this.boostLevel > 0.05;
   }
 
   get isBraking(): boolean {
@@ -87,13 +103,19 @@ export class PlayerShip {
     return this.wallStunTimer > 0;
   }
 
+  get stunRemainingMs(): number {
+    return this.wallStunTimer;
+  }
+
   setBoostLevel(level: number): void {
     this.boostLevel = Phaser.Math.Clamp(level, 0, 1);
   }
 
   freeze(): void {
     this.frozen = true;
-    this.scene.matter.body.setVelocity(this.body, { x: 0, y: 0 });
+    this.scratchVelocity.x = 0;
+    this.scratchVelocity.y = 0;
+    this.scene.matter.body.setVelocity(this.body, this.scratchVelocity);
     this.scene.matter.body.setAngularVelocity(this.body, 0);
   }
 
@@ -102,69 +124,49 @@ export class PlayerShip {
   }
 
   /**
-   * Wall collision handling:
-   * - Preserves ship facing direction
-   * - Suspends forward acceleration via wallStunTimer
-   * - Bounces off the wall reflecting velocity, preserving exact impact speed during the stun duration
+   * Evaluates impact normal, detects non-parallel angles, suspends auto-thrust for 0.35s and applies elastic recoil.
+   * Zero heap allocations.
    */
-  onWallCollision(_wallBody: MatterJS.BodyType, pair: MatterJS.IPair): void {
-    this.wallStunTimer = GAME_CONFIG.wallStunDuration;
-
-    const pairAny = pair as unknown as {
-      collision?: { normal?: { x: number; y: number } };
-      bodyA?: MatterJS.BodyType;
-    };
-
-    let nx = pairAny.collision?.normal?.x ?? 0;
-    let ny = pairAny.collision?.normal?.y ?? -1;
-
-    const len = Math.sqrt(nx * nx + ny * ny);
-    if (len > 0.0001) {
-      nx /= len;
-      ny /= len;
-    } else {
-      nx = 0;
-      ny = -1;
-    }
-
-    const sign = pairAny.bodyA === this.body ? -1 : 1;
-    const recoilNx = nx * sign;
-    const recoilNy = ny * sign;
-
-    // 1. Lock facing angle: zero out angular velocity completely
-    const currentAngle = this.body.angle;
-    this.scene.matter.body.setAngularVelocity(this.body, 0);
-    this.scene.matter.body.setAngle(this.body, currentAngle);
-
-    // 2. Measure impact speed (preserving exact speed at impact, minimum wallRecoilForce)
-    const impactSpeed = Math.max(this.speed, GAME_CONFIG.wallRecoilForce);
-    this.stunSpeed = impactSpeed;
-
-    // 3. Reflect current velocity vector off wall normal to create natural bounce
+  onWallCollision(normalX: number, normalY: number): void {
     const vx = this.body.velocity.x;
     const vy = this.body.velocity.y;
-    const dot = vx * recoilNx + vy * recoilNy;
+    const theta = this.body.angle;
+    const ux = Math.cos(theta);
+    const uy = Math.sin(theta);
 
-    let rx: number;
-    let ry: number;
-    if (dot < 0) {
-      // Reflection vector: v - 2*(v . n)*n
-      rx = vx - 2 * dot * recoilNx;
-      ry = vy - 2 * dot * recoilNy;
-      const rLen = Math.sqrt(rx * rx + ry * ry);
-      if (rLen > 0.0001) {
-        rx = (rx / rLen) * impactSpeed;
-        ry = (ry / rLen) * impactSpeed;
-      } else {
-        rx = recoilNx * impactSpeed;
-        ry = recoilNy * impactSpeed;
-      }
-    } else {
-      rx = recoilNx * impactSpeed;
-      ry = recoilNy * impactSpeed;
+    // Unit tangent of the wall
+    const tx = -normalY;
+    const ty = normalX;
+
+    // Alignment of heading with wall tangent (|u . t|)
+    const alignWithTangent = Math.abs(ux * tx + uy * ty);
+
+    // Normal component of velocity (negative when heading towards the wall)
+    const vDotN = vx * normalX + vy * normalY;
+
+    // Non-parallel impact check: steep angle into wall or significant velocity towards wall
+    const isNonParallel = alignWithTangent < 0.92 || vDotN < -0.15;
+
+    if (isNonParallel) {
+      // 1. Suspend auto-thrust during 0.35s (350ms) cooldown
+      this.wallStunTimer = GAME_CONFIG.wallStunDuration;
+
+      // 2. Lock angular velocity to prevent disorienting rotational spin
+      this.scene.matter.body.setAngularVelocity(this.body, 0);
+
+      // 3. Calculate elastic recoil vector along the contact normal
+      const normalImpactSpeed = Math.abs(vDotN);
+      const recoilSpeed = Math.max(normalImpactSpeed * 0.9, GAME_CONFIG.wallRecoilForce);
+
+      // Tangential velocity preserved with slight friction loss
+      const vTangentialX = vx - vDotN * normalX;
+      const vTangentialY = vy - vDotN * normalY;
+
+      this.scratchVelocity.x = vTangentialX * 0.6 + normalX * recoilSpeed;
+      this.scratchVelocity.y = vTangentialY * 0.6 + normalY * recoilSpeed;
+
+      this.scene.matter.body.setVelocity(this.body, this.scratchVelocity);
     }
-
-    this.pendingRecoilVelocity = { x: rx, y: ry };
   }
 
   update(delta: number): void {
@@ -173,60 +175,21 @@ export class PlayerShip {
       return;
     }
 
-    if (this.pendingRecoilVelocity) {
-      this.scene.matter.body.setVelocity(this.body, this.pendingRecoilVelocity);
-      this.pendingRecoilVelocity = null;
-    }
-
     this.updateStun(delta);
-    this.handleRotation();
+    this.handleSteeringAndBraking();
     this.handleAutoAcceleration();
-    this.decayBoost();
     this.clampSpeed(delta);
     this.drawShip();
   }
 
-  getBackCenter(offsetFactor: number = GAME_CONFIG.boostCenterOffset): Phaser.Math.Vector2 {
+  /**
+   * Fills target structure with back exhaust position without allocating new objects.
+   */
+  getTailPosition(out: { x: number; y: number }): void {
     const backAngle = this.body.angle + Math.PI;
-    const offset = this.size * offsetFactor;
-    return new Phaser.Math.Vector2(
-      this.body.position.x + Math.cos(backAngle) * offset,
-      this.body.position.y + Math.sin(backAngle) * offset
-    );
-  }
-
-  getBackRayOrigins(): { left: Phaser.Math.Vector2; right: Phaser.Math.Vector2 } {
-    const backAngle = this.body.angle + Math.PI;
-    const spread = GAME_CONFIG.boostRayAngle;
-    const offset = this.size * 0.5;
-
-    return {
-      left: new Phaser.Math.Vector2(
-        this.body.position.x + Math.cos(backAngle - spread) * offset,
-        this.body.position.y + Math.sin(backAngle - spread) * offset
-      ),
-      right: new Phaser.Math.Vector2(
-        this.body.position.x + Math.cos(backAngle + spread) * offset,
-        this.body.position.y + Math.sin(backAngle + spread) * offset
-      ),
-    };
-  }
-
-  getBackRayEndpoints(rayLength: number): { left: Phaser.Math.Vector2; right: Phaser.Math.Vector2 } {
-    const origins = this.getBackRayOrigins();
-    const backAngle = this.body.angle + Math.PI;
-    const spread = GAME_CONFIG.boostRayAngle;
-
-    return {
-      left: new Phaser.Math.Vector2(
-        origins.left.x + Math.cos(backAngle - spread) * rayLength,
-        origins.left.y + Math.sin(backAngle - spread) * rayLength
-      ),
-      right: new Phaser.Math.Vector2(
-        origins.right.x + Math.cos(backAngle + spread) * rayLength,
-        origins.right.y + Math.sin(backAngle + spread) * rayLength
-      ),
-    };
+    const offset = this.size * 0.55;
+    out.x = this.body.position.x + Math.cos(backAngle) * offset;
+    out.y = this.body.position.y + Math.sin(backAngle) * offset;
   }
 
   destroy(): void {
@@ -240,16 +203,21 @@ export class PlayerShip {
     }
   }
 
-  private handleRotation(): void {
-    if (this.isBraking) {
+  private handleSteeringAndBraking(): void {
+    const leftDown = this.cursors.left.isDown || this.keyA.isDown;
+    const rightDown = this.cursors.right.isDown || this.keyD.isDown;
+
+    if (leftDown && rightDown) {
+      // Dual Brake: high friction air, cancel angular motion
+      this.body.frictionAir = GAME_CONFIG.brakeFrictionAir;
       this.scene.matter.body.setAngularVelocity(this.body, 0);
       return;
     }
 
-    const rotSpeed = GAME_CONFIG.rotationSpeed;
-    const leftDown = this.cursors.left.isDown || this.keyA.isDown;
-    const rightDown = this.cursors.right.isDown || this.keyD.isDown;
+    // Normal friction air
+    this.body.frictionAir = GAME_CONFIG.frictionAir;
 
+    const rotSpeed = GAME_CONFIG.rotationSpeed;
     if (leftDown) {
       this.scene.matter.body.setAngularVelocity(this.body, -rotSpeed);
     } else if (rightDown) {
@@ -259,164 +227,161 @@ export class PlayerShip {
     }
   }
 
-  /**
-   * Configurable linear auto-acceleration
-   */
   private handleAutoAcceleration(): void {
+    // Suspend forward thrust during braking or stun
     if (this.isBraking || this.isStunned) return;
 
     const angle = this.body.angle;
     const baseForce = GAME_CONFIG.thrustForce;
 
-    this.scene.matter.body.applyForce(this.body, this.body.position, {
-      x: Math.cos(angle) * baseForce,
-      y: Math.sin(angle) * baseForce,
-    });
-  }
+    this.scratchForce.x = Math.cos(angle) * baseForce;
+    this.scratchForce.y = Math.sin(angle) * baseForce;
 
-  private decayBoost(): void {
-    if (this.boostLevel > 0) {
-      this.boostLevel = Math.max(0, this.boostLevel - GAME_CONFIG.boostFadeRate);
-    }
+    this.scene.matter.body.applyForce(this.body, this.body.position, this.scratchForce);
   }
 
   private clampSpeed(delta: number): void {
-    if (this.isStunned) {
-      const v = this.body.velocity;
-      const spd = Math.sqrt(v.x * v.x + v.y * v.y);
-      if (spd > 0.0001 && this.stunSpeed > 0) {
-        const scale = this.stunSpeed / spd;
-        this.scene.matter.body.setVelocity(this.body, {
-          x: v.x * scale,
-          y: v.y * scale,
-        });
-      }
-      return;
-    }
-
-    // Smoothly interpolate speed limit upwards while boosting, and decelerate smoothly when leaving boost
+    // Dynamic speed limit interpolation
     if (this.isBoosting) {
-      this.currentSpeedLimit = Phaser.Math.Linear(this.currentSpeedLimit, GAME_CONFIG.maxBoostSpeed, 0.1);
+      const targetLimit = GAME_CONFIG.maxSpeed + (GAME_CONFIG.maxBoostSpeed - GAME_CONFIG.maxSpeed) * this.boostLevel;
+      this.currentSpeedLimit = Phaser.Math.Linear(this.currentSpeedLimit, targetLimit, 0.12);
     } else {
-      const decayStep = GAME_CONFIG.boostDeceleration * (delta / 16.66);
-      this.currentSpeedLimit = Math.max(GAME_CONFIG.maxSpeed, this.currentSpeedLimit - decayStep);
+      const decay = GAME_CONFIG.boostDeceleration * (delta / 16.666);
+      this.currentSpeedLimit = Math.max(GAME_CONFIG.maxSpeed, this.currentSpeedLimit - decay);
     }
 
-    const vel = this.body.velocity;
-    const spd = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
-    if (spd > this.currentSpeedLimit) {
+    const vx = this.body.velocity.x;
+    const vy = this.body.velocity.y;
+    const spd = Math.sqrt(vx * vx + vy * vy);
+
+    if (spd > this.currentSpeedLimit && spd > 0.0001) {
       const scale = this.currentSpeedLimit / spd;
-      this.scene.matter.body.setVelocity(this.body, {
-        x: vel.x * scale,
-        y: vel.y * scale,
-      });
+      this.scratchVelocity.x = vx * scale;
+      this.scratchVelocity.y = vy * scale;
+      this.scene.matter.body.setVelocity(this.body, this.scratchVelocity);
     }
   }
 
   private drawShip(): void {
     this.graphics.clear();
 
-    const boostT = this.boostLevel;
-    const baseColor = boostT > 0.1 ? this.lerpColor(GAME_CONFIG.shipColor, GAME_CONFIG.boostColor, boostT) : GAME_CONFIG.shipColor;
-    const glowColor = boostT > 0.1 ? 0xffffaa : 0xff88ff;
-    const stunFlash = this.isStunned && Math.floor(this.wallStunTimer / 40) % 2 === 0;
+    const cx = this.body.position.x;
+    const cy = this.body.position.y;
+    const angle = this.body.angle;
+    const size = this.size;
 
-    if (!stunFlash) {
-      this.graphics.lineStyle(2, glowColor, 0.25);
-      this.drawIsosceles(this.graphics, this.body.position.x, this.body.position.y, this.body.angle, this.size + 5);
-    }
-
-    this.graphics.lineStyle(2, stunFlash ? 0xff3333 : baseColor, 1);
-    this.graphics.fillStyle(stunFlash ? 0xff3333 : baseColor, 0.2);
-    this.drawIsosceles(this.graphics, this.body.position.x, this.body.position.y, this.body.angle, this.size);
-
-    if (!this.isBraking && !this.isStunned) {
-      this.drawExhaust(baseColor);
-    }
-
-    if (this.isBraking) {
-      this.drawBrakeIndicator();
-    }
-  }
-
-  private drawIsosceles(g: Phaser.GameObjects.Graphics, cx: number, cy: number, angle: number, size: number): void {
-    const noseLength = size * 1.6;
-    const baseHalf = size * 0.65;
-
-    const nose = new Phaser.Math.Vector2(
-      cx + Math.cos(angle) * noseLength,
-      cy + Math.sin(angle) * noseLength
-    );
-
+    // Precalculate elongated isosceles triangle vertices
+    const noseLength = size * 1.55;
+    const wingWidth = size * 0.65;
     const backAngle = angle + Math.PI;
     const perpAngle = angle + Math.PI / 2;
 
-    const backCenter = new Phaser.Math.Vector2(
-      cx + Math.cos(backAngle) * size * 0.5,
-      cy + Math.sin(backAngle) * size * 0.5
-    );
+    this.noseX = cx + Math.cos(angle) * noseLength;
+    this.noseY = cy + Math.sin(angle) * noseLength;
 
-    const left = new Phaser.Math.Vector2(
-      backCenter.x + Math.cos(perpAngle) * baseHalf,
-      backCenter.y + Math.sin(perpAngle) * baseHalf
-    );
+    const backCenterX = cx + Math.cos(backAngle) * (size * 0.45);
+    const backCenterY = cy + Math.sin(backAngle) * (size * 0.45);
 
-    const right = new Phaser.Math.Vector2(
-      backCenter.x - Math.cos(perpAngle) * baseHalf,
-      backCenter.y - Math.sin(perpAngle) * baseHalf
-    );
+    this.leftWingX = backCenterX + Math.cos(perpAngle) * wingWidth;
+    this.leftWingY = backCenterY + Math.sin(perpAngle) * wingWidth;
 
-    g.beginPath();
-    g.moveTo(nose.x, nose.y);
-    g.lineTo(left.x, left.y);
-    g.lineTo(right.x, right.y);
-    g.closePath();
-    g.strokePath();
-    g.fillPath();
+    this.rightWingX = backCenterX - Math.cos(perpAngle) * wingWidth;
+    this.rightWingY = backCenterY - Math.sin(perpAngle) * wingWidth;
+
+    this.innerCenterX = cx + Math.cos(angle) * (size * 0.2);
+    this.innerCenterY = cy + Math.sin(angle) * (size * 0.2);
+
+    const boostT = this.boostLevel;
+    const isStunFlash = this.isStunned && Math.floor(this.wallStunTimer / 50) % 2 === 0;
+
+    let baseColor = GAME_CONFIG.shipColor;
+    if (boostT > 0.05) {
+      baseColor = this.lerpColor(GAME_CONFIG.shipColor, GAME_CONFIG.boostColor, boostT);
+    }
+    if (isStunFlash) {
+      baseColor = 0xff2244;
+    }
+
+    // Outer glow aura
+    this.graphics.lineStyle(4, baseColor, isStunFlash ? 0.35 : 0.2 + boostT * 0.3);
+    this.graphics.beginPath();
+    this.graphics.moveTo(this.noseX, this.noseY);
+    this.graphics.lineTo(this.leftWingX, this.leftWingY);
+    this.graphics.lineTo(this.innerCenterX, this.innerCenterY);
+    this.graphics.lineTo(this.rightWingX, this.rightWingY);
+    this.graphics.closePath();
+    this.graphics.strokePath();
+
+    // Solid inner hull
+    this.graphics.fillStyle(isStunFlash ? 0xff2244 : 0x050c18, 0.88);
+    this.graphics.fillPath();
+
+    // Crisp neon edge stroke
+    this.graphics.lineStyle(2, isStunFlash ? 0xff4455 : baseColor, 1.0);
+    this.graphics.beginPath();
+    this.graphics.moveTo(this.noseX, this.noseY);
+    this.graphics.lineTo(this.leftWingX, this.leftWingY);
+    this.graphics.lineTo(this.innerCenterX, this.innerCenterY);
+    this.graphics.lineTo(this.rightWingX, this.rightWingY);
+    this.graphics.closePath();
+    this.graphics.strokePath();
+
+    // Front tip cockpit neon accent
+    this.graphics.lineStyle(1.5, 0xffffff, 0.9);
+    this.graphics.beginPath();
+    this.graphics.moveTo(this.noseX, this.noseY);
+    this.graphics.lineTo(cx + Math.cos(angle) * (size * 0.6), cy + Math.sin(angle) * (size * 0.6));
+    this.graphics.strokePath();
+
+    // Exhaust thrust flame
+    if (!this.isBraking && !this.isStunned) {
+      this.drawExhaustFlame(backCenterX, backCenterY, backAngle, baseColor, boostT);
+    }
+
+    // Dual Brake indicator lights
+    if (this.isBraking) {
+      this.drawBrakeFlares(perpAngle);
+    }
   }
 
-  private drawExhaust(color: number): void {
-    const backAngle = this.body.angle + Math.PI;
-    const baseX = this.body.position.x + Math.cos(backAngle) * this.size * 0.5;
-    const baseY = this.body.position.y + Math.sin(backAngle) * this.size * 0.5;
+  private drawExhaustFlame(baseX: number, baseY: number, backAngle: number, color: number, boost: number): void {
+    const flameLen = this.size * (0.8 + boost * 1.4);
+    const tipX = baseX + Math.cos(backAngle) * flameLen;
+    const tipY = baseY + Math.sin(backAngle) * flameLen;
 
-    const boostScale = 1 + this.boostLevel * 1.5;
-    const exhaustLen = this.size * 0.7 * boostScale;
-    const flickerLen = exhaustLen * (0.7 + Math.random() * 0.6);
+    const spreadAngle = 0.38;
+    const spreadW = this.size * 0.28;
+    const lx = baseX + Math.cos(backAngle - spreadAngle) * spreadW;
+    const ly = baseY + Math.sin(backAngle - spreadAngle) * spreadW;
+    const rx = baseX + Math.cos(backAngle + spreadAngle) * spreadW;
+    const ry = baseY + Math.sin(backAngle + spreadAngle) * spreadW;
 
-    const tipX = baseX + Math.cos(backAngle) * flickerLen;
-    const tipY = baseY + Math.sin(backAngle) * flickerLen;
-
-    const spread = 0.35;
-    const wingSize = this.size * 0.25;
-    const leftX = baseX + Math.cos(backAngle - spread) * wingSize;
-    const leftY = baseY + Math.sin(backAngle - spread) * wingSize;
-    const rightX = baseX + Math.cos(backAngle + spread) * wingSize;
-    const rightY = baseY + Math.sin(backAngle + spread) * wingSize;
-
-    this.graphics.fillStyle(color, 0.5 + this.boostLevel * 0.3);
+    this.graphics.fillStyle(color, 0.75 + boost * 0.25);
     this.graphics.beginPath();
-    this.graphics.moveTo(leftX, leftY);
+    this.graphics.moveTo(lx, ly);
     this.graphics.lineTo(tipX, tipY);
-    this.graphics.lineTo(rightX, rightY);
+    this.graphics.lineTo(rx, ry);
     this.graphics.closePath();
     this.graphics.fillPath();
 
-    this.graphics.fillStyle(0xffffff, 0.7);
-    this.graphics.fillCircle(baseX, baseY, 1.5 + this.boostLevel * 1.5);
+    // Inner bright core
+    this.graphics.fillStyle(0xffffff, 0.85);
+    this.graphics.fillCircle(baseX, baseY, 2.0 + boost * 1.5);
   }
 
-  private drawBrakeIndicator(): void {
-    const backAngle = this.body.angle + Math.PI;
-    const perpAngle = this.body.angle + Math.PI / 2;
-    const offset = this.size * 0.6;
+  private drawBrakeFlares(perpAngle: number): void {
+    const leftX = this.leftWingX + Math.cos(perpAngle) * 3;
+    const leftY = this.leftWingY + Math.sin(perpAngle) * 3;
+    const rightX = this.rightWingX - Math.cos(perpAngle) * 3;
+    const rightY = this.rightWingY - Math.sin(perpAngle) * 3;
 
-    for (const side of [-1, 1]) {
-      const bx = this.body.position.x + Math.cos(backAngle) * this.size * 0.3 + Math.cos(perpAngle) * offset * side;
-      const by = this.body.position.y + Math.sin(backAngle) * this.size * 0.3 + Math.sin(perpAngle) * offset * side;
-      this.graphics.fillStyle(0xff4444, 0.6 + Math.random() * 0.3);
-      this.graphics.fillCircle(bx, by, 2.5);
-    }
+    this.graphics.fillStyle(0xff1133, 0.9);
+    this.graphics.fillCircle(leftX, leftY, 3);
+    this.graphics.fillCircle(rightX, rightY, 3);
+
+    this.graphics.fillStyle(0xff8899, 0.7);
+    this.graphics.fillCircle(leftX, leftY, 1.5);
+    this.graphics.fillCircle(rightX, rightY, 1.5);
   }
 
   private lerpColor(from: number, to: number, t: number): number {

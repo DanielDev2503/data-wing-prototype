@@ -1,102 +1,51 @@
 import Phaser from "phaser";
 import { GAME_CONFIG, LevelState } from "../config";
 import { PlayerShip } from "../entities/PlayerShip";
-import { WallBoost } from "../systems/WallBoost";
+import { WallBoost, TrackSegment } from "../systems/WallBoost";
 import { NeonTrail } from "../systems/NeonTrail";
 
-interface WallSegment {
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
-}
-
-class TrackBuilder {
-  public x: number;
-  public y: number;
-  public angle: number;
-  public halfWidth: number;
-
-  public outerPoints: Phaser.Math.Vector2[] = [];
-  public innerPoints: Phaser.Math.Vector2[] = [];
-
-  constructor(startX: number, startY: number, startAngle: number, halfWidth: number) {
-    this.x = startX;
-    this.y = startY;
-    this.angle = startAngle;
-    this.halfWidth = halfWidth;
-
-    this.addPoints(this.x, this.y, this.angle);
-  }
-
-  private addPoints(cx: number, cy: number, heading: number): void {
-    const leftNormal = heading - Math.PI / 2;
-    const rightNormal = heading + Math.PI / 2;
-
-    const lx = cx + Math.cos(leftNormal) * this.halfWidth;
-    const ly = cy + Math.sin(leftNormal) * this.halfWidth;
-
-    const rx = cx + Math.cos(rightNormal) * this.halfWidth;
-    const ry = cy + Math.sin(rightNormal) * this.halfWidth;
-
-    this.outerPoints.push(new Phaser.Math.Vector2(lx, ly));
-    this.innerPoints.push(new Phaser.Math.Vector2(rx, ry));
-  }
-
-  public straight(distance: number, steps = 8): void {
-    const stepDist = distance / steps;
-    const dirX = Math.cos(this.angle);
-    const dirY = Math.sin(this.angle);
-
-    for (let i = 1; i <= steps; i++) {
-      this.x += dirX * stepDist;
-      this.y += dirY * stepDist;
-      this.addPoints(this.x, this.y, this.angle);
-    }
-  }
-
-  public turn(radius: number, sweepAngle: number, steps = 16): void {
-    const isRight = sweepAngle > 0;
-    const normalAngle = this.angle + (isRight ? Math.PI / 2 : -Math.PI / 2);
-    const centerX = this.x + Math.cos(normalAngle) * radius;
-    const centerY = this.y + Math.sin(normalAngle) * radius;
-
-    const startCenterAngle = Math.atan2(this.y - centerY, this.x - centerX);
-    const stepAngle = sweepAngle / steps;
-
-    for (let i = 1; i <= steps; i++) {
-      const a = startCenterAngle + stepAngle * i;
-      this.x = centerX + Math.cos(a) * radius;
-      this.y = centerY + Math.sin(a) * radius;
-      this.angle += stepAngle;
-      this.addPoints(this.x, this.y, this.angle);
-    }
-  }
+interface SplinePoint {
+  x: number;
+  y: number;
 }
 
 export class GameScene extends Phaser.Scene {
   private ship!: PlayerShip;
   private wallBoost!: WallBoost;
   private neonTrail!: NeonTrail;
+
+  // Graphics layers
+  private bgGraphics!: Phaser.GameObjects.Graphics;
+  private trackFloorGraphics!: Phaser.GameObjects.Graphics;
   private wallGraphics!: Phaser.GameObjects.Graphics;
   private zoneGraphics!: Phaser.GameObjects.Graphics;
-  private bgGraphics!: Phaser.GameObjects.Graphics;
+  private hudGraphics!: Phaser.GameObjects.Graphics;
   private pauseOverlay!: Phaser.GameObjects.Graphics;
   private completionOverlay!: Phaser.GameObjects.Graphics;
-  private wallBodies: MatterJS.BodyType[] = [];
 
+  // Track data
+  private trackSegments: TrackSegment[] = [];
+  private cameraAnchor!: Phaser.GameObjects.Image | Phaser.GameObjects.Arc;
+
+  // Game state
   private levelState: LevelState = LevelState.Waiting;
   private raceTimer: number = 0;
   private finalRaceTime: number = 0;
+  private hasReachedHalfwayCheckpoint: boolean = false;
+
+  // HUD text objects
   private timerText!: Phaser.GameObjects.Text;
   private stateText!: Phaser.GameObjects.Text;
   private speedText!: Phaser.GameObjects.Text;
-  private configText!: Phaser.GameObjects.Text;
-  private boostBar!: Phaser.GameObjects.Graphics;
   private pauseText!: Phaser.GameObjects.Text;
   private completionContainer!: Phaser.GameObjects.Container;
+
+  // Keys
   private escKey!: Phaser.Input.Keyboard.Key;
   private rKey!: Phaser.Input.Keyboard.Key;
+
+  // Preallocated formatted string buffer components to minimize GC
+  private cachedSpeedVal: number = -1;
 
   constructor() {
     super({ key: "GameScene" });
@@ -106,27 +55,32 @@ export class GameScene extends Phaser.Scene {
     this.levelState = LevelState.Waiting;
     this.raceTimer = 0;
     this.finalRaceTime = 0;
+    this.hasReachedHalfwayCheckpoint = false;
+    this.trackSegments = [];
 
-    this.buildBackground();
-    this.buildOrganicCircuit();
-    this.buildZones();
+    this.buildCyberGrid();
+    this.buildSmoothCurvedCircuit();
+    this.buildSensorsAndZones();
 
-    // Spawn player at start position facing UP (-Math.PI/2)
-    this.ship = new PlayerShip(this, 600, 1600);
+    // Spawn player at start position on the track, facing North (-PI/2)
+    const spawnX = 700;
+    const spawnY = 2250;
+    this.ship = new PlayerShip(this, spawnX, spawnY);
     this.ship.matterBody.angle = -Math.PI / 2;
 
     this.wallBoost = new WallBoost(this, this.ship);
-    this.wallBoost.setWallBodies(this.wallBodies);
+    this.wallBoost.setSegments(this.trackSegments);
+
     this.neonTrail = new NeonTrail(this, this.ship);
 
-    this.setupCollisionHandler();
-    this.setupCamera();
-    this.setupBloom();
+    this.setupCollisionEvents();
+    this.setupCameraFollow();
+    this.setupPostFXBloom();
     this.buildHUD();
-    this.setupPause();
+    this.setupPauseSystem();
     this.setupCompletionUI();
 
-    // Key shortcut R to restart anytime
+    // Global quick restart key: R
     this.rKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.R);
     this.rKey.on("down", () => {
       this.scene.restart();
@@ -134,11 +88,17 @@ export class GameScene extends Phaser.Scene {
   }
 
   update(_time: number, delta: number): void {
-    if (this.levelState === LevelState.Paused || this.levelState === LevelState.Completed) {
-      this.ship.update(delta);
+    if (this.levelState === LevelState.Paused) {
       return;
     }
 
+    if (this.levelState === LevelState.Completed) {
+      this.ship.update(delta);
+      this.updateCameraAnchor();
+      return;
+    }
+
+    // Kinematic updates
     this.ship.update(delta);
     this.wallBoost.update();
     this.neonTrail.update(delta);
@@ -147,25 +107,26 @@ export class GameScene extends Phaser.Scene {
       this.raceTimer += delta;
     }
 
+    this.updateCameraAnchor();
     this.updateHUD();
   }
 
-  private buildBackground(): void {
+  private buildCyberGrid(): void {
     this.bgGraphics = this.add.graphics();
     this.bgGraphics.setDepth(0);
 
-    const gridSize = 100;
     const w = GAME_CONFIG.worldWidth;
     const h = GAME_CONFIG.worldHeight;
+    const step = 80;
 
-    this.bgGraphics.lineStyle(1, 0x0a0a1a, 0.4);
-    for (let x = 0; x <= w; x += gridSize) {
+    this.bgGraphics.lineStyle(1, 0x0c1122, 0.45);
+    for (let x = 0; x <= w; x += step) {
       this.bgGraphics.beginPath();
       this.bgGraphics.moveTo(x, 0);
       this.bgGraphics.lineTo(x, h);
       this.bgGraphics.strokePath();
     }
-    for (let y = 0; y <= h; y += gridSize) {
+    for (let y = 0; y <= h; y += step) {
       this.bgGraphics.beginPath();
       this.bgGraphics.moveTo(0, y);
       this.bgGraphics.lineTo(w, y);
@@ -173,183 +134,348 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  private buildOrganicCircuit(): void {
-    this.wallGraphics = this.add.graphics();
-    this.wallGraphics.setDepth(2);
+  /**
+   * Generates a procedural smooth curved race track via Catmull-Rom spline interpolation,
+   * constructing continuous wall bodies and zero-gap collision boundaries.
+   */
+  private buildSmoothCurvedCircuit(): void {
+    this.trackFloorGraphics = this.add.graphics().setDepth(1);
+    this.wallGraphics = this.add.graphics().setDepth(2);
 
-    const builder = new TrackBuilder(600, 1800, -Math.PI / 2, 140);
+    // High-level racing track control nodes (smooth circuit layout)
+    const controlNodes: SplinePoint[] = [
+      { x: 700, y: 2200 },  // 0: Start line heading North
+      { x: 700, y: 1400 },  // 1: North straightaway
+      { x: 800, y: 920 },   // 2: Sweeping entrance into turn 1
+      { x: 1250, y: 680 },  // 3: Sweeping curve East
+      { x: 1850, y: 720 },  // 4: Technical North-East section
+      { x: 2250, y: 1050 }, // 5: Chicane left
+      { x: 2600, y: 950 },  // 6: Chicane right
+      { x: 3150, y: 1150 }, // 7: Hairpin entry
+      { x: 3450, y: 1750 }, // 8: Parabolic 180-degree banking apex (Wall-boost paradise)
+      { x: 3250, y: 2350 }, // 9: Hairpin exit swinging West
+      { x: 2700, y: 2600 }, // 10: High-speed downhill straight
+      { x: 1850, y: 2600 }, // 11: Southern straight
+      { x: 1150, y: 2550 }, // 12: Approach curve
+      { x: 750, y: 2420 },  // 13: Final banking curve into straightaway
+    ];
 
-    builder.straight(1000, 10);
-    builder.turn(400, Math.PI, 18);
-    builder.straight(400, 6);
-    builder.turn(250, -Math.PI / 2, 12);
-    builder.turn(250, Math.PI / 2, 12);
-    builder.straight(100, 2);
-    builder.turn(650, Math.PI, 24);
+    // Spline sampling
+    const numSamples = 160;
+    const splinePoints: SplinePoint[] = [];
 
-    const outerSegments = this.pointsToSegments(builder.outerPoints);
-    const innerSegments = this.pointsToSegments(builder.innerPoints);
-
-    const allSegments = [...outerSegments, ...innerSegments];
-
-    for (const seg of allSegments) {
-      this.createWallBody(seg);
+    for (let i = 0; i < numSamples; i++) {
+      const t = i / numSamples;
+      const pt = this.sampleCatmullRom(controlNodes, t);
+      splinePoints.push(pt);
     }
 
-    this.drawWalls(outerSegments, GAME_CONFIG.wallColor);
-    this.drawWalls(innerSegments, GAME_CONFIG.wallColor);
-    this.drawCornerGlow(builder.outerPoints);
-    this.drawCornerGlow(builder.innerPoints);
-  }
+    const halfWidth = 140; // 280px wide track
+    const leftPoints: SplinePoint[] = [];
+    const rightPoints: SplinePoint[] = [];
 
-  private pointsToSegments(points: Phaser.Math.Vector2[]): WallSegment[] {
-    const segs: WallSegment[] = [];
-    for (let i = 0; i < points.length - 1; i++) {
-      segs.push({
-        x1: points[i].x,
-        y1: points[i].y,
-        x2: points[i + 1].x,
-        y2: points[i + 1].y,
+    // Calculate perpendicular track boundaries
+    for (let i = 0; i < splinePoints.length; i++) {
+      const prev = splinePoints[(i - 1 + splinePoints.length) % splinePoints.length];
+      const next = splinePoints[(i + 1) % splinePoints.length];
+
+      let dx = next.x - prev.x;
+      let dy = next.y - prev.y;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len > 0.0001) {
+        dx /= len;
+        dy /= len;
+      }
+
+      // Normal perpendicular to track direction
+      const nx = -dy;
+      const ny = dx;
+
+      const curr = splinePoints[i];
+      leftPoints.push({
+        x: curr.x + nx * halfWidth,
+        y: curr.y + ny * halfWidth,
+      });
+      rightPoints.push({
+        x: curr.x - nx * halfWidth,
+        y: curr.y - ny * halfWidth,
       });
     }
-    return segs;
+
+    // Draw dark asphalt floor
+    this.trackFloorGraphics.fillStyle(0x040812, 0.95);
+    for (let i = 0; i < splinePoints.length; i++) {
+      const nextIdx = (i + 1) % splinePoints.length;
+      this.trackFloorGraphics.beginPath();
+      this.trackFloorGraphics.moveTo(leftPoints[i].x, leftPoints[i].y);
+      this.trackFloorGraphics.lineTo(leftPoints[nextIdx].x, leftPoints[nextIdx].y);
+      this.trackFloorGraphics.lineTo(rightPoints[nextIdx].x, rightPoints[nextIdx].y);
+      this.trackFloorGraphics.lineTo(rightPoints[i].x, rightPoints[i].y);
+      this.trackFloorGraphics.closePath();
+      this.trackFloorGraphics.fillPath();
+    }
+
+    // Draw subtle track centerline markers
+    this.trackFloorGraphics.lineStyle(1.5, 0x00f0ff, 0.12);
+    for (let i = 0; i < splinePoints.length; i += 2) {
+      const nextIdx = (i + 1) % splinePoints.length;
+      this.trackFloorGraphics.beginPath();
+      this.trackFloorGraphics.moveTo(splinePoints[i].x, splinePoints[i].y);
+      this.trackFloorGraphics.lineTo(splinePoints[nextIdx].x, splinePoints[nextIdx].y);
+      this.trackFloorGraphics.strokePath();
+    }
+
+    // Create physics and visual wall segments for left and right boundaries
+    this.buildWallChain(leftPoints, true);
+    this.buildWallChain(rightPoints, false);
   }
 
-  private createWallBody(seg: WallSegment): void {
-    const cx = (seg.x1 + seg.x2) / 2;
-    const cy = (seg.y1 + seg.y2) / 2;
-    const dx = seg.x2 - seg.x1;
-    const dy = seg.y2 - seg.y1;
-    const length = Math.sqrt(dx * dx + dy * dy);
-    if (length < 1) return;
-    const angle = Math.atan2(dy, dx);
+  private buildWallChain(points: SplinePoint[], isLeft: boolean): void {
+    const wallColor = GAME_CONFIG.wallColor;
+    const count = points.length;
 
-    const wall = this.matter.add.rectangle(cx, cy, length, 8, {
-      isStatic: true,
-      angle: angle,
-      friction: 0.5,
-      restitution: 0.25,
-      label: "wall",
-    });
+    for (let i = 0; i < count; i++) {
+      const nextIdx = (i + 1) % count;
+      const p1 = points[i];
+      const p2 = points[nextIdx];
 
-    this.wallBodies.push(wall);
-  }
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 1) continue;
 
-  private drawWalls(segments: WallSegment[], color: number): void {
-    this.wallGraphics.lineStyle(4, color, 0.3);
-    for (const seg of segments) {
+      const midX = (p1.x + p2.x) * 0.5;
+      const midY = (p1.y + p2.y) * 0.5;
+      const angle = Math.atan2(dy, dx);
+
+      // Normal pointing inward towards track center
+      let nx = -dy / len;
+      let ny = dx / len;
+      if (!isLeft) {
+        nx = -nx;
+        ny = -ny;
+      }
+
+      const tx = -ny;
+      const ty = nx;
+
+      // Matter static wall segment body with +3px length overlap to eliminate caught seams
+      this.matter.add.rectangle(midX, midY, len + 3, 14, {
+        isStatic: true,
+        angle: angle,
+        friction: 0.0,
+        restitution: 0.2,
+        label: "wall",
+      });
+
+      // Register segment for continuous WallBoost proximity calculations
+      this.trackSegments.push({
+        x1: p1.x,
+        y1: p1.y,
+        x2: p2.x,
+        y2: p2.y,
+        midX: midX,
+        midY: midY,
+        nx: nx,
+        ny: ny,
+        tx: tx,
+        ty: ty,
+        length: len,
+        lengthSq: len * len,
+      });
+
+      // Multi-pass neon glow visual rendering
+      // 1. Broad soft ambient glow
+      this.wallGraphics.lineStyle(5, wallColor, 0.2);
       this.wallGraphics.beginPath();
-      this.wallGraphics.moveTo(seg.x1, seg.y1);
-      this.wallGraphics.lineTo(seg.x2, seg.y2);
+      this.wallGraphics.moveTo(p1.x, p1.y);
+      this.wallGraphics.lineTo(p2.x, p2.y);
       this.wallGraphics.strokePath();
-    }
 
-    this.wallGraphics.lineStyle(1.8, color, 0.95);
-    for (const seg of segments) {
+      // 2. High-intensity crisp neon core line
+      this.wallGraphics.lineStyle(2, wallColor, 0.95);
       this.wallGraphics.beginPath();
-      this.wallGraphics.moveTo(seg.x1, seg.y1);
-      this.wallGraphics.lineTo(seg.x2, seg.y2);
+      this.wallGraphics.moveTo(p1.x, p1.y);
+      this.wallGraphics.lineTo(p2.x, p2.y);
       this.wallGraphics.strokePath();
+
+      // Periodic wall nodes
+      if (i % 6 === 0) {
+        this.wallGraphics.fillStyle(0xffffff, 0.9);
+        this.wallGraphics.fillCircle(p1.x, p1.y, 2.5);
+      }
     }
   }
 
-  private drawCornerGlow(points: Phaser.Math.Vector2[]): void {
-    for (let i = 0; i < points.length; i += 4) {
-      this.wallGraphics.fillStyle(GAME_CONFIG.wallColor, 0.15);
-      this.wallGraphics.fillCircle(points[i].x, points[i].y, 4);
-    }
+  private sampleCatmullRom(pts: SplinePoint[], tGlobal: number): SplinePoint {
+    const n = pts.length;
+    const clampedT = Phaser.Math.Clamp(tGlobal, 0, 0.999999);
+    const scaled = clampedT * n;
+    const idx = Math.floor(scaled);
+    const t = scaled - idx;
+
+    const p0 = pts[(idx - 1 + n) % n];
+    const p1 = pts[idx % n];
+    const p2 = pts[(idx + 1) % n];
+    const p3 = pts[(idx + 2) % n];
+
+    const t2 = t * t;
+    const t3 = t2 * t;
+
+    const v0x = (p2.x - p0.x) * 0.5;
+    const v0y = (p2.y - p0.y) * 0.5;
+    const v1x = (p3.x - p1.x) * 0.5;
+    const v1y = (p3.y - p1.y) * 0.5;
+
+    const x = (2 * p1.x - 2 * p2.x + v0x + v1x) * t3 +
+              (-3 * p1.x + 3 * p2.x - 2 * v0x - v1x) * t2 +
+              v0x * t + p1.x;
+
+    const y = (2 * p1.y - 2 * p2.y + v0y + v1y) * t3 +
+              (-3 * p1.y + 3 * p2.y - 2 * v0y - v1y) * t2 +
+              v0y * t + p1.y;
+
+    return { x, y };
   }
 
-  private buildZones(): void {
-    this.zoneGraphics = this.add.graphics();
-    this.zoneGraphics.setDepth(1);
+  private buildSensorsAndZones(): void {
+    this.zoneGraphics = this.add.graphics().setDepth(2);
 
-    this.createZone(600, 1600, 275, 60, GAME_CONFIG.startZoneColor, "startZone");
-    this.createZone(600, 1750, 275, 60, GAME_CONFIG.finishZoneColor, "finishZone");
-  }
+    // Start Line sensor (at x=700, y=2150, spanning track)
+    this.createSensorLine(700, 2150, 276, 50, 0, GAME_CONFIG.startZoneColor, "startZone", "START LINE");
 
-  private createZone(x: number, y: number, w: number, h: number, color: number, label: string): void {
-    this.matter.add.rectangle(x, y, w, h, {
+    // Halfway Checkpoint (at hairpin apex x=3450, y=1750) to prevent lap short-circuiting
+    this.matter.add.rectangle(3450, 1750, 276, 80, {
       isStatic: true,
       isSensor: true,
+      label: "checkpointZone",
+    });
+
+    // Finish Line sensor (at x=700, y=2050, just after the start line on the main straightaway)
+    this.createSensorLine(700, 2050, 276, 50, 0, GAME_CONFIG.finishZoneColor, "finishZone", "FINISH LINE");
+  }
+
+  private createSensorLine(
+    cx: number,
+    cy: number,
+    w: number,
+    h: number,
+    angle: number,
+    color: number,
+    label: string,
+    labelText: string
+  ): void {
+    this.matter.add.rectangle(cx, cy, w, h, {
+      isStatic: true,
+      isSensor: true,
+      angle: angle,
       label: label,
     });
 
-    this.zoneGraphics.lineStyle(2, color, 0.7);
-    this.zoneGraphics.strokeRect(x - w / 2, y - h / 2, w, h);
-    this.zoneGraphics.fillStyle(color, 0.1);
-    this.zoneGraphics.fillRect(x - w / 2, y - h / 2, w, h);
+    this.zoneGraphics.lineStyle(2, color, 0.8);
+    this.zoneGraphics.strokeRect(cx - w * 0.5, cy - h * 0.5, w, h);
+    this.zoneGraphics.fillStyle(color, 0.15);
+    this.zoneGraphics.fillRect(cx - w * 0.5, cy - h * 0.5, w, h);
 
-    const labelText = label === "startZone" ? "START LINE" : "FINISH LINE";
-    this.add.text(x, y, labelText, {
+    this.add.text(cx, cy, labelText, {
       fontFamily: "'Courier New', monospace",
       fontSize: "14px",
+      fontStyle: "bold",
       color: "#" + color.toString(16).padStart(6, "0"),
-    }).setOrigin(0.5, 0.5).setDepth(2);
+    }).setOrigin(0.5, 0.5).setDepth(3);
   }
 
-  private setupCollisionHandler(): void {
-    this.matter.world.on("collisionstart", (_event: unknown, bodyA: MatterJS.BodyType, bodyB: MatterJS.BodyType) => {
-      const ship = this.ship.matterBody;
-      const aId = (bodyA as unknown as { id: number }).id;
-      const bId = (bodyB as unknown as { id: number }).id;
-      const sId = (ship as unknown as { id: number }).id;
-      const isShipA = aId === sId;
-      const isShipB = bId === sId;
+  private setupCollisionEvents(): void {
+    this.matter.world.on(
+      "collisionstart",
+      (event: Phaser.Physics.Matter.Events.CollisionStartEvent) => {
+        const shipBody = this.ship.matterBody;
+        const pairs = event.pairs;
 
-      if (!isShipA && !isShipB) return;
+        for (let i = 0; i < pairs.length; i++) {
+          const pair = pairs[i];
+          const isA = pair.bodyA === shipBody;
+          const isB = pair.bodyB === shipBody;
 
-      const other = isShipA ? bodyB : bodyA;
+          if (!isA && !isB) continue;
 
-      if (other.label === "wall") {
-        type PairWithIds = { bodyA: { id: number }; bodyB: { id: number } };
-        const pairs = (this.matter.world.engine as unknown as { pairs: { list: MatterJS.IPair[] } }).pairs.list;
-        const shipId = (ship as unknown as { id: number }).id;
-        const otherId = (other as unknown as { id: number }).id;
-        const pair = pairs.find(p => {
-          const pa = p as unknown as PairWithIds;
-          return (pa.bodyA.id === shipId && pa.bodyB.id === otherId) ||
-                 (pa.bodyB.id === shipId && pa.bodyA.id === otherId);
-        });
-        if (pair) {
-          this.ship.onWallCollision(other, pair);
+          const other = isA ? pair.bodyB : pair.bodyA;
+
+          if (other.label === "wall") {
+            // Determine normal pointing towards the ship
+            let nx = pair.collision.normal.x;
+            let ny = pair.collision.normal.y;
+
+            if (isA) {
+              nx = -nx;
+              ny = -ny;
+            }
+
+            const len = Math.sqrt(nx * nx + ny * ny);
+            if (len > 0.0001) {
+              nx /= len;
+              ny /= len;
+            } else {
+              nx = 0;
+              ny = -1;
+            }
+
+            this.ship.onWallCollision(nx, ny);
+          }
+
+          if (other.label === "startZone") {
+            if (this.levelState === LevelState.Waiting) {
+              this.levelState = LevelState.Playing;
+              this.raceTimer = 0;
+              this.hasReachedHalfwayCheckpoint = false;
+            }
+          }
+
+          if (other.label === "checkpointZone") {
+            if (this.levelState === LevelState.Playing) {
+              this.hasReachedHalfwayCheckpoint = true;
+            }
+          }
+
+          if (other.label === "finishZone") {
+            if (this.levelState === LevelState.Playing && this.hasReachedHalfwayCheckpoint) {
+              this.levelState = LevelState.Completed;
+              this.finalRaceTime = this.raceTimer;
+              this.ship.freeze();
+              this.showCompletionScreen();
+            }
+          }
         }
       }
-
-      if (other.label === "startZone" && this.levelState === LevelState.Waiting) {
-        this.levelState = LevelState.Playing;
-        this.raceTimer = 0;
-      }
-
-      if (other.label === "finishZone" && this.levelState === LevelState.Playing) {
-        this.levelState = LevelState.Completed;
-        this.finalRaceTime = this.raceTimer;
-        this.ship.freeze();
-        this.showCompletionScreen();
-      }
-    });
+    );
   }
 
-  private setupCamera(): void {
+  private setupCameraFollow(): void {
     const cam = this.cameras.main;
     cam.setBounds(0, 0, GAME_CONFIG.worldWidth, GAME_CONFIG.worldHeight);
     cam.setZoom(GAME_CONFIG.cameraZoom);
 
-    const shipBody = this.ship.matterBody;
-    const follower = this.add.circle(shipBody.position.x, shipBody.position.y, 1, 0x000000, 0).setDepth(-1);
-
-    this.events.on("update", () => {
-      follower.setPosition(shipBody.position.x, shipBody.position.y);
-    });
-
-    cam.startFollow(follower, false, GAME_CONFIG.cameraLerp, GAME_CONFIG.cameraLerp);
+    // Follower anchor for smooth lerping and velocity lookahead
+    this.cameraAnchor = this.add.circle(this.ship.x, this.ship.y, 1, 0x000000, 0).setDepth(-1);
+    cam.startFollow(this.cameraAnchor, false, GAME_CONFIG.cameraLerp, GAME_CONFIG.cameraLerp);
   }
 
-  private setupBloom(): void {
+  private updateCameraAnchor(): void {
+    // Lead camera slightly ahead in the direction of velocity for dynamic game feel
+    const vx = this.ship.velocity.x;
+    const vy = this.ship.velocity.y;
+    const lookaheadX = this.ship.x + vx * 12;
+    const lookaheadY = this.ship.y + vy * 12;
+
+    this.cameraAnchor.setPosition(lookaheadX, lookaheadY);
+  }
+
+  private setupPostFXBloom(): void {
     const cam = this.cameras.main as Phaser.Cameras.Scene2D.Camera & {
-      postFX?: { addBloom: (color: number, offsetX: number, offsetY: number, strength: number, blurStrength: number) => void }
+      postFX?: { addBloom: (color: number, offsetX: number, offsetY: number, strength: number, blurStrength: number) => void };
     };
-    if (cam.postFX) {
+
+    if (cam.postFX && typeof cam.postFX.addBloom === "function") {
       cam.postFX.addBloom(0xffffff, 1, 1, GAME_CONFIG.bloomStrength, 1.2);
     }
   }
@@ -359,57 +485,68 @@ export class GameScene extends Phaser.Scene {
       fontFamily: "'Courier New', monospace",
       fontSize: "14px",
       color: "#00ffff",
-      stroke: "#001a1a",
-      strokeThickness: 2,
+      stroke: "#020713",
+      strokeThickness: 3,
     };
 
-    this.add.text(16, 16, "DATA WING", {
-      ...hudStyle, fontSize: "20px", color: "#ff00ff",
+    this.add.text(18, 16, "DATA WING", {
+      ...hudStyle,
+      fontSize: "22px",
+      fontStyle: "bold",
+      color: "#ff007f",
     }).setDepth(100).setScrollFactor(0);
 
-    this.add.text(16, 42, "←→/A-D Steer | A+D/←+→ Brake | R Restart | ESC Pause", {
-      ...hudStyle, fontSize: "11px",
-    }).setDepth(100).setScrollFactor(0);
-
-    this.timerText = this.add.text(GAME_CONFIG.width - 16, 16, "00:00.000", {
-      ...hudStyle, fontSize: "18px", color: "#ffffff",
-    }).setOrigin(1, 0).setDepth(100).setScrollFactor(0);
-
-    this.stateText = this.add.text(GAME_CONFIG.width / 2, 50, "CROSS START LINE TO BEGIN", {
-      ...hudStyle, fontSize: "16px", color: "#00ff88",
-    }).setOrigin(0.5, 0.5).setDepth(100).setScrollFactor(0);
-
-    this.speedText = this.add.text(16, GAME_CONFIG.height - 30, "", hudStyle).setDepth(100).setScrollFactor(0);
-
-    this.configText = this.add.text(16, 68, "", {
+    this.add.text(18, 44, "←→/A-D: Steer | A+D/←+→: Dual Brake | R: Restart | ESC: Pause", {
       ...hudStyle,
       fontSize: "11px",
-      color: "#ff8800",
+      color: "#88ccff",
     }).setDepth(100).setScrollFactor(0);
 
-    this.boostBar = this.add.graphics();
-    this.boostBar.setDepth(100);
-    this.boostBar.setScrollFactor(0);
+    this.timerText = this.add.text(GAME_CONFIG.width - 18, 16, "00:00.000", {
+      ...hudStyle,
+      fontSize: "24px",
+      fontStyle: "bold",
+      color: "#ffffff",
+    }).setOrigin(1, 0).setDepth(100).setScrollFactor(0);
+
+    this.stateText = this.add.text(GAME_CONFIG.width * 0.5, 48, "CROSS START LINE TO BEGIN", {
+      ...hudStyle,
+      fontSize: "15px",
+      fontStyle: "bold",
+      color: "#00ff88",
+    }).setOrigin(0.5, 0.5).setDepth(100).setScrollFactor(0);
+
+    this.speedText = this.add.text(18, GAME_CONFIG.height - 32, "SPEED: 000", {
+      ...hudStyle,
+      fontSize: "16px",
+      fontStyle: "bold",
+      color: "#00ffff",
+    }).setDepth(100).setScrollFactor(0);
+
+    this.hudGraphics = this.add.graphics().setDepth(100).setScrollFactor(0);
   }
 
-  private setupPause(): void {
-    this.pauseOverlay = this.add.graphics();
-    this.pauseOverlay.setDepth(200);
-    this.pauseOverlay.setScrollFactor(0);
-    this.pauseOverlay.setVisible(false);
+  private setupPauseSystem(): void {
+    this.pauseOverlay = this.add.graphics().setDepth(200).setScrollFactor(0).setVisible(false);
 
-    this.pauseText = this.add.text(GAME_CONFIG.width / 2, GAME_CONFIG.height / 2, "PAUSED\n\nPress ESC to resume", {
-      fontFamily: "'Courier New', monospace",
-      fontSize: "28px",
-      color: "#ff00ff",
-      align: "center",
-      stroke: "#330033",
-      strokeThickness: 3,
-    }).setOrigin(0.5, 0.5).setDepth(201).setScrollFactor(0).setVisible(false);
+    this.pauseText = this.add.text(
+      GAME_CONFIG.width * 0.5,
+      GAME_CONFIG.height * 0.5,
+      "PAUSED\n\n[ PRESS ESC TO RESUME ]\n[ PRESS R TO RESTART ]",
+      {
+        fontFamily: "'Courier New', monospace",
+        fontSize: "26px",
+        fontStyle: "bold",
+        color: "#ff007f",
+        align: "center",
+        stroke: "#110022",
+        strokeThickness: 4,
+      }
+    ).setOrigin(0.5, 0.5).setDepth(201).setScrollFactor(0).setVisible(false);
 
     this.escKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.ESC);
     this.escKey.on("down", () => {
-      if (this.levelState === LevelState.Playing) {
+      if (this.levelState === LevelState.Playing || this.levelState === LevelState.Waiting) {
         this.pauseGame();
       } else if (this.levelState === LevelState.Paused) {
         this.resumeGame();
@@ -417,69 +554,12 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
-  private setupCompletionUI(): void {
-    this.completionOverlay = this.add.graphics();
-    this.completionOverlay.setDepth(300);
-    this.completionOverlay.setScrollFactor(0);
-    this.completionOverlay.setVisible(false);
-
-    this.completionContainer = this.add.container(GAME_CONFIG.width / 2, GAME_CONFIG.height / 2);
-    this.completionContainer.setDepth(301);
-    this.completionContainer.setScrollFactor(0);
-    this.completionContainer.setVisible(false);
-  }
-
-  private showCompletionScreen(): void {
-    const formattedTime = this.formatTime(this.finalRaceTime);
-
-    this.completionOverlay.clear();
-    this.completionOverlay.fillStyle(0x000000, 0.82);
-    this.completionOverlay.fillRect(0, 0, GAME_CONFIG.width, GAME_CONFIG.height);
-    this.completionOverlay.setVisible(true);
-
-    this.completionContainer.removeAll(true);
-
-    const titleText = this.add.text(0, -90, "★ CIRCUIT COMPLETED ★", {
-      fontFamily: "'Courier New', monospace",
-      fontSize: "32px",
-      color: "#00ffff",
-      stroke: "#004444",
-      strokeThickness: 3,
-    }).setOrigin(0.5, 0.5);
-
-    const timeLabel = this.add.text(0, -20, "FINAL TIME", {
-      fontFamily: "'Courier New', monospace",
-      fontSize: "16px",
-      color: "#aaaaaa",
-    }).setOrigin(0.5, 0.5);
-
-    const timeValue = this.add.text(0, 20, formattedTime, {
-      fontFamily: "'Courier New', monospace",
-      fontSize: "46px",
-      color: "#ffff00",
-      stroke: "#444400",
-      strokeThickness: 4,
-    }).setOrigin(0.5, 0.5);
-
-    const restartHint = this.add.text(0, 90, "[ PRESS 'R' TO RESTART CIRCUIT ]", {
-      fontFamily: "'Courier New', monospace",
-      fontSize: "18px",
-      color: "#ff00ff",
-      stroke: "#330033",
-      strokeThickness: 2,
-    }).setOrigin(0.5, 0.5);
-
-    this.completionContainer.add([titleText, timeLabel, timeValue, restartHint]);
-    this.completionContainer.setVisible(true);
-  }
-
   private pauseGame(): void {
     this.levelState = LevelState.Paused;
     this.matter.world.pause();
-    this.ship.freeze();
 
     this.pauseOverlay.clear();
-    this.pauseOverlay.fillStyle(0x000000, 0.7);
+    this.pauseOverlay.fillStyle(0x02040a, 0.78);
     this.pauseOverlay.fillRect(0, 0, GAME_CONFIG.width, GAME_CONFIG.height);
     this.pauseOverlay.setVisible(true);
     this.pauseText.setVisible(true);
@@ -488,77 +568,127 @@ export class GameScene extends Phaser.Scene {
   private resumeGame(): void {
     this.levelState = LevelState.Playing;
     this.matter.world.resume();
-    this.ship.unfreeze();
 
     this.pauseOverlay.setVisible(false);
     this.pauseText.setVisible(false);
   }
 
-  private formatTime(timeMs: number): string {
-    const totalMs = Math.floor(timeMs);
-    const minutes = Math.floor(totalMs / 60000);
-    const seconds = Math.floor((totalMs % 60000) / 1000);
-    const ms = totalMs % 1000;
-    return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
+  private setupCompletionUI(): void {
+    this.completionOverlay = this.add.graphics().setDepth(300).setScrollFactor(0).setVisible(false);
+
+    this.completionContainer = this.add.container(GAME_CONFIG.width * 0.5, GAME_CONFIG.height * 0.5);
+    this.completionContainer.setDepth(301).setScrollFactor(0).setVisible(false);
+  }
+
+  private showCompletionScreen(): void {
+    const formatted = this.formatTime(this.finalRaceTime);
+
+    this.completionOverlay.clear();
+    this.completionOverlay.fillStyle(0x02040e, 0.85);
+    this.completionOverlay.fillRect(0, 0, GAME_CONFIG.width, GAME_CONFIG.height);
+    this.completionOverlay.setVisible(true);
+
+    this.completionContainer.removeAll(true);
+
+    const banner = this.add.text(0, -90, "★ CIRCUIT CLEARED ★", {
+      fontFamily: "'Courier New', monospace",
+      fontSize: "32px",
+      fontStyle: "bold",
+      color: "#00ffff",
+      stroke: "#003344",
+      strokeThickness: 4,
+    }).setOrigin(0.5, 0.5);
+
+    const label = this.add.text(0, -20, "OFFICIAL LAP TIME", {
+      fontFamily: "'Courier New', monospace",
+      fontSize: "15px",
+      color: "#88aacc",
+    }).setOrigin(0.5, 0.5);
+
+    const time = this.add.text(0, 24, formatted, {
+      fontFamily: "'Courier New', monospace",
+      fontSize: "48px",
+      fontStyle: "bold",
+      color: "#ffe600",
+      stroke: "#332200",
+      strokeThickness: 5,
+    }).setOrigin(0.5, 0.5);
+
+    const hint = this.add.text(0, 100, "[ PRESS 'R' TO RESTART CIRCUIT ]", {
+      fontFamily: "'Courier New', monospace",
+      fontSize: "17px",
+      fontStyle: "bold",
+      color: "#ff007f",
+      stroke: "#220011",
+      strokeThickness: 3,
+    }).setOrigin(0.5, 0.5);
+
+    this.completionContainer.add([banner, label, time, hint]);
+    this.completionContainer.setVisible(true);
+  }
+
+  private formatTime(msTotal: number): string {
+    const total = Math.floor(msTotal);
+    const mins = Math.floor(total / 60000);
+    const secs = Math.floor((total % 60000) / 1000);
+    const ms = total % 1000;
+    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
   }
 
   private updateHUD(): void {
-    const vel = this.ship.velocity;
-    const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
-    this.speedText.setText(`SPEED: ${(speed * 100).toFixed(0)}`);
+    const speed = this.ship.speed;
+    const roundedSpeed = Math.round(speed * 100);
 
-    this.configText.setText(
-      `[ CONFIG VARIABLES ]\n` +
-      `THRUST FORCE: ${GAME_CONFIG.thrustForce}\n` +
-      `BOOST FORCE: ${GAME_CONFIG.boostForce}\n` +
-      `BOOST PROXIMITY EXPONENT: ${GAME_CONFIG.boostProximityExponent}\n` +
-      `BOOST DECELERATION: ${GAME_CONFIG.boostDeceleration}\n` +
-      `BOOST RAY LENGTH: ${GAME_CONFIG.boostRayLength}\n` +
-      `BOOST RAY ANGLE: ${GAME_CONFIG.boostRayAngle}\n` +
-      `BOOST CENTER OFFSET: ${GAME_CONFIG.boostCenterOffset}\n` +
-      `WALL RECOIL FORCE: ${GAME_CONFIG.wallRecoilForce}\n` +
-      `WALL STUN DURATION: ${GAME_CONFIG.wallStunDuration}ms`
-    );
-
-    const currentDisplayTime = this.levelState === LevelState.Completed ? this.finalRaceTime : this.raceTimer;
-    this.timerText.setText(this.formatTime(currentDisplayTime));
-
-    switch (this.levelState) {
-      case LevelState.Waiting:
-        this.stateText.setText("CROSS START LINE TO BEGIN");
-        this.stateText.setColor("#00ff88");
-        this.stateText.setVisible(true);
-        break;
-      case LevelState.Playing:
-        this.stateText.setVisible(false);
-        break;
-      case LevelState.Completed:
-        this.stateText.setVisible(false);
-        break;
-      default:
-        break;
+    if (roundedSpeed !== this.cachedSpeedVal) {
+      this.cachedSpeedVal = roundedSpeed;
+      this.speedText.setText(`SPEED: ${roundedSpeed.toString().padStart(3, "0")}`);
+      if (this.ship.isBoosting) {
+        this.speedText.setColor("#ff007f");
+      } else {
+        this.speedText.setColor("#00ffff");
+      }
     }
 
-    this.boostBar.clear();
+    const currentDisplayTime = this.levelState === LevelState.Completed
+      ? this.finalRaceTime
+      : this.raceTimer;
+    this.timerText.setText(this.formatTime(currentDisplayTime));
+
+    if (this.levelState === LevelState.Waiting) {
+      this.stateText.setText("CROSS START LINE TO BEGIN");
+      this.stateText.setColor("#00ff88");
+      this.stateText.setVisible(true);
+    } else if (this.ship.isStunned) {
+      this.stateText.setText("⚠ IMPACT RECOIL - STUNNED ⚠");
+      this.stateText.setColor("#ff2244");
+      this.stateText.setVisible(true);
+    } else if (this.ship.isBraking) {
+      this.stateText.setText("⚡ DUAL BRAKE ENGAGED ⚡");
+      this.stateText.setColor("#ffaa00");
+      this.stateText.setVisible(true);
+    } else {
+      this.stateText.setVisible(false);
+    }
+
+    // Dynamic Wall-Boost Gauge Bar at the bottom center
+    this.hudGraphics.clear();
     const boost = this.ship.currentBoostLevel;
+
+    const barW = 180;
+    const barH = 12;
+    const bx = (GAME_CONFIG.width - barW) * 0.5;
+    const by = GAME_CONFIG.height - 34;
+
+    this.hudGraphics.lineStyle(1.5, 0x1a2b44, 0.8);
+    this.hudGraphics.strokeRect(bx, by, barW, barH);
+    this.hudGraphics.fillStyle(0x050c18, 0.7);
+    this.hudGraphics.fillRect(bx, by, barW, barH);
+
     if (boost > 0.01) {
-      const barW = 140;
-      const barH = 10;
-      const bx = GAME_CONFIG.width / 2 - barW / 2;
-      const by = GAME_CONFIG.height - 35;
-
-      this.boostBar.lineStyle(1, 0x555555, 0.8);
-      this.boostBar.strokeRect(bx, by, barW, barH);
-
-      const fillColor = Phaser.Display.Color.Interpolate.ColorWithColor(
-        Phaser.Display.Color.ValueToColor(GAME_CONFIG.shipColor),
-        Phaser.Display.Color.ValueToColor(GAME_CONFIG.boostColor),
-        1, boost
-      );
-      const hexColor = Phaser.Display.Color.GetColor(fillColor.r, fillColor.g, fillColor.b);
-
-      this.boostBar.fillStyle(hexColor, 0.85);
-      this.boostBar.fillRect(bx + 1, by + 1, (barW - 2) * boost, barH - 2);
+      const fillW = (barW - 4) * boost;
+      const boostColor = this.ship.isBoosting ? GAME_CONFIG.boostColor : GAME_CONFIG.wallColor;
+      this.hudGraphics.fillStyle(boostColor, 0.9);
+      this.hudGraphics.fillRect(bx + 2, by + 2, fillW, barH - 4);
     }
   }
 }

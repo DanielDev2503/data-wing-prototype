@@ -2,91 +2,151 @@ import Phaser from "phaser";
 import { GAME_CONFIG } from "../config";
 import { PlayerShip } from "../entities/PlayerShip";
 
-interface RayResult {
-  hit: boolean;
-  distance: number;
-  normalizedDistance: number;
-  normalX: number;
-  normalY: number;
+export interface TrackSegment {
+  readonly x1: number;
+  readonly y1: number;
+  readonly x2: number;
+  readonly y2: number;
+  readonly midX: number;
+  readonly midY: number;
+  readonly nx: number;
+  readonly ny: number;
+  readonly tx: number;
+  readonly ty: number;
+  readonly length: number;
+  readonly lengthSq: number;
 }
 
 export class WallBoost {
   private readonly scene: Phaser.Scene;
   private readonly ship: PlayerShip;
-  private readonly rayLength: number;
   private readonly debugGraphics: Phaser.GameObjects.Graphics;
-  private wallBodies: MatterJS.BodyType[] = [];
+  private segments: TrackSegment[] = [];
+
+  private currentIntensity: number = 0;
+
+  // Zero-GC preallocated structures
+  private readonly scratchForce = { x: 0, y: 0 };
+  private readonly closestWall = {
+    hit: false,
+    distance: 9999,
+    nx: 0,
+    ny: 0,
+    tx: 0,
+    ty: 0,
+    qx: 0,
+    qy: 0,
+  };
 
   constructor(scene: Phaser.Scene, ship: PlayerShip) {
     this.scene = scene;
     this.ship = ship;
-    this.rayLength = GAME_CONFIG.boostRayLength;
+
     this.debugGraphics = scene.add.graphics();
-    this.debugGraphics.setDepth(5);
+    this.debugGraphics.setDepth(6);
   }
 
-  setWallBodies(bodies: MatterJS.BodyType[]): void {
-    this.wallBodies = bodies;
+  get intensity(): number {
+    return this.currentIntensity;
+  }
+
+  setSegments(segments: TrackSegment[]): void {
+    this.segments = segments;
   }
 
   update(): void {
     this.debugGraphics.clear();
 
-    if (this.ship.isBraking || this.ship.isStunned) return;
-
-    const center = this.ship.getBackCenter();
-    const backAngle = this.ship.angle + Math.PI;
-    const spread = GAME_CONFIG.boostRayAngle;
-    const numRays = 15;
-
-    let closestResult: RayResult = {
-      hit: false,
-      distance: this.rayLength,
-      normalizedDistance: 1,
-      normalX: 0,
-      normalY: 0,
-    };
-
-    const rayResults: { start: Phaser.Math.Vector2; end: Phaser.Math.Vector2; result: RayResult }[] = [];
-
-    for (let i = 0; i < numRays; i++) {
-      const t = numRays > 1 ? i / (numRays - 1) : 0.5;
-      const rayAngle = backAngle - spread + t * (2 * spread);
-
-      const end = new Phaser.Math.Vector2(
-        center.x + Math.cos(rayAngle) * this.rayLength,
-        center.y + Math.sin(rayAngle) * this.rayLength
-      );
-
-      const result = this.castRayWithDistance(center, end);
-      rayResults.push({ start: center, end, result });
-
-      if (result.hit && result.distance < closestResult.distance) {
-        closestResult = result;
-      }
+    if (this.ship.isBraking || this.ship.isStunned) {
+      this.currentIntensity = Phaser.Math.Linear(this.currentIntensity, 0, 0.2);
+      this.ship.setBoostLevel(this.currentIntensity);
+      return;
     }
 
-    const bestProximity = closestResult.hit ? (1 - closestResult.normalizedDistance) : 0;
+    const shipX = this.ship.x;
+    const shipY = this.ship.y;
+    const shipAngle = this.ship.angle;
+    const shipRadius = GAME_CONFIG.shipRadius;
+    const rProx = GAME_CONFIG.boostProximityRadius;
 
-    // Draw the semicircle / sector detection zone delimited by boostRayAngle
-    this.drawSemicircleZone(center, backAngle, spread, bestProximity, rayResults);
+    // Unit forward vector of the ship
+    const ux = Math.cos(shipAngle);
+    const uy = Math.sin(shipAngle);
 
-    if (bestProximity > 0.05 && closestResult.hit) {
-      const alignmentFactor = this.computeAlignmentFactor();
-      // Boost becomes exponentially stronger as the rays get closer to the wall
-      const proximityFactor = Math.pow(bestProximity, GAME_CONFIG.boostProximityExponent);
-      const boostValue = proximityFactor * alignmentFactor;
-      const currentBoost = this.ship.currentBoostLevel;
-      const targetBoost = Phaser.Math.Clamp(boostValue, 0, 1);
+    // Ship velocity vector
+    const vel = this.ship.velocity;
+    const vx = vel.x;
+    const vy = vel.y;
+    const speed = Math.sqrt(vx * vx + vy * vy);
 
-      if (targetBoost > currentBoost) {
-        this.ship.setBoostLevel(Phaser.Math.Linear(currentBoost, targetBoost, 0.15));
+    // 1. Check proximity towards all segments to find closest wall within rProx
+    this.findClosestSegment(shipX, shipY, shipRadius, rProx);
+
+    if (this.closestWall.hit && this.closestWall.distance < rProx) {
+      const d = Math.max(0, this.closestWall.distance);
+      const nx = this.closestWall.nx;
+      const ny = this.closestWall.ny;
+
+      // 2. Unit tangent of the segment: t = (-n_y, n_x)
+      let tx = -ny;
+      let ty = nx;
+
+      // 3. Dynamic Sign Orientation: force tangent towards velocity vector (or forward vector if near stationary)
+      const dotV = vx * tx + vy * ty;
+      const dotU = ux * tx + uy * ty;
+      const alignTest = speed > 0.4 ? dotV : dotU;
+
+      let tfwdX = tx;
+      let tfwdY = ty;
+      if (alignTest < 0) {
+        tfwdX = -tx;
+        tfwdY = -ty;
       }
 
-      this.applyWallBoostPhysics(closestResult.normalX, closestResult.normalY, boostValue);
+      // 4. Angular alignment factor: f_theta = |u . t_fwd|
+      const dotUT = ux * tfwdX + uy * tfwdY;
+      const fTheta = Phaser.Math.Clamp(Math.abs(dotUT), 0, 1);
+
+      // 5. Proximity factor: f_d = clamp(1 - (d / r_prox), 0, 1)
+      const rawProximity = Phaser.Math.Clamp(1 - d / rProx, 0, 1);
+      const fD = Math.pow(rawProximity, GAME_CONFIG.boostProximityExponent);
+
+      // Target boost acceleration factor
+      const targetBoost = fD * fTheta;
+
+      // Smooth interpolation to avoid abrupt steps
+      this.currentIntensity = Phaser.Math.Linear(
+        this.currentIntensity,
+        targetBoost,
+        GAME_CONFIG.boostLerpSpeed
+      );
+
+      // 6. Resulting acceleration: a_boost = t_fwd * (k_boost * f_d * f_theta)
+      const kBoost = GAME_CONFIG.boostForce;
+      const boostMagnitude = kBoost * this.currentIntensity;
+
+      // Apply tangential boost force + subtle outward cushion to glide cleanly along curvature
+      const cushion = d < 8 ? kBoost * 0.12 * fD : 0;
+      this.scratchForce.x = tfwdX * boostMagnitude + nx * cushion;
+      this.scratchForce.y = tfwdY * boostMagnitude + ny * cushion;
+
+      this.scene.matter.body.applyForce(
+        this.ship.matterBody,
+        this.ship.matterBody.position,
+        this.scratchForce
+      );
+
+      this.ship.setBoostLevel(this.currentIntensity);
+
+      // 7. Visual Grazing FX
+      this.drawWallGrazingFX(shipX, shipY, this.closestWall.qx, this.closestWall.qy, d, rProx, this.currentIntensity);
     } else {
-      // Immediately stop boost when rays are not in contact with a wall
-      this.ship.setBoostLevel(0);
+      // Smooth decay when out of boost proximity
+      this.currentIntensity = Phaser.Math.Linear(this.currentIntensity, 0, 0.2);
+      if (this.currentIntensity < 0.01) {
+        this.currentIntensity = 0;
+      }
+      this.ship.setBoostLevel(this.currentIntensity);
     }
   }
 
@@ -94,174 +154,106 @@ export class WallBoost {
     this.debugGraphics.destroy();
   }
 
-  /**
-   * Applies the physical perpendicular/tangential boost acceleration printed by the wall onto the ship
-   */
-  private applyWallBoostPhysics(nx: number, ny: number, boostValue: number): void {
-    const shipAngle = this.ship.angle;
-    const fx = Math.cos(shipAngle);
-    const fy = Math.sin(shipAngle);
+  private findClosestSegment(px: number, py: number, radius: number, maxDist: number): void {
+    let minDistance = maxDist + radius;
+    let found = false;
+    let bestNx = 0;
+    let bestNy = 0;
+    let bestQx = 0;
+    let bestQy = 0;
 
-    // Calculate component of forward vector along wall normal
-    const dot = fx * nx + fy * ny;
+    const maxSearchDistSq = (maxDist + radius + 20) * (maxDist + radius + 20);
 
-    // Tangent vector along wall parallel to ship forward motion
-    let tx = fx - dot * nx;
-    let ty = fy - dot * ny;
-    const tLen = Math.sqrt(tx * tx + ty * ty);
-    if (tLen > 0.0001) {
-      tx /= tLen;
-      ty /= tLen;
-    } else {
-      tx = fx;
-      ty = fy;
-    }
+    for (let i = 0; i < this.segments.length; i++) {
+      const seg = this.segments[i];
 
-    // Perpendicular force: mostly tangential along wall surface + slight outward push to glide along wall
-    const wallForceMagnitude = GAME_CONFIG.boostForce * boostValue;
-    const boostForceX = (tx * 0.85 + nx * 0.15) * wallForceMagnitude;
-    const boostForceY = (ty * 0.85 + ny * 0.15) * wallForceMagnitude;
-
-    this.scene.matter.body.applyForce(this.ship.matterBody, this.ship.matterBody.position, {
-      x: boostForceX,
-      y: boostForceY,
-    });
-  }
-
-  private castRayWithDistance(start: Phaser.Math.Vector2, end: Phaser.Math.Vector2): RayResult {
-    if (this.wallBodies.length === 0) {
-      return { hit: false, distance: this.rayLength, normalizedDistance: 1, normalX: 0, normalY: 0 };
-    }
-
-    const collisions = this.scene.matter.query.ray(
-      this.wallBodies,
-      { x: start.x, y: start.y },
-      { x: end.x, y: end.y }
-    );
-
-    if (collisions.length === 0) {
-      return { hit: false, distance: this.rayLength, normalizedDistance: 1, normalX: 0, normalY: 0 };
-    }
-
-    let minDist = this.rayLength;
-    let hitNormalX = 0;
-    let hitNormalY = 0;
-
-    for (const collision of collisions) {
-      const c = collision as unknown as {
-        body?: MatterJS.BodyType;
-        bodyA?: MatterJS.BodyType;
-        point?: { x: number; y: number };
-        normal?: { x: number; y: number };
-      };
-      const targetBody = c.body || c.bodyA;
-      let dist = this.rayLength;
-
-      if (c.point) {
-        const dx = c.point.x - start.x;
-        const dy = c.point.y - start.y;
-        dist = Math.sqrt(dx * dx + dy * dy);
-      } else if (targetBody && targetBody.position) {
-        const dx = targetBody.position.x - start.x;
-        const dy = targetBody.position.y - start.y;
-        dist = Math.sqrt(dx * dx + dy * dy);
+      // Quick bounding check
+      const dMidX = px - seg.midX;
+      const dMidY = py - seg.midY;
+      const halfL = seg.length * 0.5 + maxDist + radius;
+      if (Math.abs(dMidX) > halfL || Math.abs(dMidY) > halfL) {
+        continue;
       }
 
-      if (dist < minDist) {
-        minDist = dist;
-        if (c.normal) {
-          hitNormalX = c.normal.x;
-          hitNormalY = c.normal.y;
-        } else if (targetBody) {
-          const dx = start.x - targetBody.position.x;
-          const dy = start.y - targetBody.position.y;
-          const dLen = Math.sqrt(dx * dx + dy * dy) || 1;
-          hitNormalX = dx / dLen;
-          hitNormalY = dy / dLen;
+      // Point-to-segment projection
+      const dx = seg.x2 - seg.x1;
+      const dy = seg.y2 - seg.y1;
+      const vx = px - seg.x1;
+      const vy = py - seg.y1;
+
+      const t = Phaser.Math.Clamp((vx * dx + vy * dy) / seg.lengthSq, 0, 1);
+      const qx = seg.x1 + t * dx;
+      const qy = seg.y1 + t * dy;
+
+      const rx = px - qx;
+      const ry = py - qy;
+      const distSq = rx * rx + ry * ry;
+
+      if (distSq < maxSearchDistSq) {
+        const dist = Math.sqrt(distSq);
+        if (dist < minDistance) {
+          minDistance = dist;
+          found = true;
+          bestQx = qx;
+          bestQy = qy;
+
+          if (dist > 0.0001) {
+            bestNx = rx / dist;
+            bestNy = ry / dist;
+          } else {
+            bestNx = seg.nx;
+            bestNy = seg.ny;
+          }
         }
       }
     }
 
-    return {
-      hit: true,
-      distance: minDist,
-      normalizedDistance: Phaser.Math.Clamp(minDist / this.rayLength, 0, 1),
-      normalX: hitNormalX,
-      normalY: hitNormalY,
-    };
+    this.closestWall.hit = found;
+    this.closestWall.distance = Math.max(0, minDistance - radius);
+    this.closestWall.nx = bestNx;
+    this.closestWall.ny = bestNy;
+    this.closestWall.qx = bestQx;
+    this.closestWall.qy = bestQy;
   }
 
-  private computeAlignmentFactor(): number {
-    const vel = this.ship.velocity;
-    const speed = this.ship.speed;
-    if (speed < 0.5) return 0.3;
-
-    const moveAngle = Math.atan2(vel.y, vel.x);
-    const shipAngle = this.ship.angle;
-    let diff = Math.abs(moveAngle - shipAngle);
-    if (diff > Math.PI) diff = Math.PI * 2 - diff;
-
-    const alignment = 1 - diff / Math.PI;
-    return Phaser.Math.Clamp(alignment, 0.1, 1);
-  }
-
-  private drawSemicircleZone(
-    center: Phaser.Math.Vector2,
-    backAngle: number,
-    spread: number,
-    bestProximity: number,
-    rayResults: { start: Phaser.Math.Vector2; end: Phaser.Math.Vector2; result: RayResult }[]
+  private drawWallGrazingFX(
+    sx: number,
+    sy: number,
+    qx: number,
+    qy: number,
+    dist: number,
+    rProx: number,
+    intensity: number
   ): void {
-    const startAngle = backAngle - spread;
-    const endAngle = backAngle + spread;
+    if (intensity < 0.05) return;
 
-    // Fill sector area with boost glow color scaled by proximity
-    const fillAlpha = bestProximity > 0 ? 0.08 + bestProximity * 0.45 : 0.04;
-    this.debugGraphics.fillStyle(GAME_CONFIG.boostColor, fillAlpha);
-    this.debugGraphics.beginPath();
-    this.debugGraphics.moveTo(center.x, center.y);
-    this.debugGraphics.arc(center.x, center.y, this.rayLength, startAngle, endAngle, false);
-    this.debugGraphics.closePath();
-    this.debugGraphics.fillPath();
+    const proxRatio = Phaser.Math.Clamp(1 - dist / rProx, 0, 1);
+    const glowAlpha = 0.2 + proxRatio * 0.4 + intensity * 0.4;
+    const color = GAME_CONFIG.boostColor;
 
-    // Stroke boundary outline of the sector
-    const strokeColor = bestProximity > 0
-      ? this.lerpColor(0x555555, GAME_CONFIG.boostColor, bestProximity)
-      : 0x333333;
-    const strokeAlpha = bestProximity > 0 ? 0.4 + bestProximity * 0.5 : 0.2;
-    this.debugGraphics.lineStyle(1.5, strokeColor, strokeAlpha);
+    // Glowing energy arc between ship grazing wing and the wall contact point
+    this.debugGraphics.lineStyle(2 + intensity * 2, color, glowAlpha);
     this.debugGraphics.beginPath();
-    this.debugGraphics.moveTo(center.x, center.y);
-    this.debugGraphics.arc(center.x, center.y, this.rayLength, startAngle, endAngle, false);
-    this.debugGraphics.closePath();
+    this.debugGraphics.moveTo(sx, sy);
+    this.debugGraphics.lineTo(qx, qy);
     this.debugGraphics.strokePath();
 
-    // Draw individual ray hits within sector
-    for (const item of rayResults) {
-      if (item.result.hit) {
-        const prox = 1 - item.result.normalizedDistance;
-        const rayDirAngle = Math.atan2(item.end.y - center.y, item.end.x - center.x);
-        const hitX = center.x + Math.cos(rayDirAngle) * item.result.distance;
-        const hitY = center.y + Math.sin(rayDirAngle) * item.result.distance;
+    // Electric grazing contact spark at the wall surface
+    this.debugGraphics.fillStyle(0xffffff, 0.9);
+    this.debugGraphics.fillCircle(qx, qy, 2.5 + intensity * 2.5);
 
-        this.debugGraphics.lineStyle(1, GAME_CONFIG.boostColor, 0.2 + prox * 0.5);
-        this.debugGraphics.beginPath();
-        this.debugGraphics.moveTo(center.x, center.y);
-        this.debugGraphics.lineTo(hitX, hitY);
-        this.debugGraphics.strokePath();
+    this.debugGraphics.fillStyle(color, 0.6 + intensity * 0.4);
+    this.debugGraphics.fillCircle(qx, qy, 4.5 + intensity * 4.0);
 
-        this.debugGraphics.fillStyle(GAME_CONFIG.boostColor, 0.5 + prox * 0.5);
-        this.debugGraphics.fillCircle(hitX, hitY, 1.5 + prox * 2);
-      }
-    }
-  }
+    // Wall surface glow line
+    const tangentSpread = 16 + intensity * 24;
+    const tx = -this.closestWall.ny;
+    const ty = this.closestWall.nx;
 
-  private lerpColor(from: number, to: number, t: number): number {
-    const fr = (from >> 16) & 0xff, fg = (from >> 8) & 0xff, fb = from & 0xff;
-    const tr = (to >> 16) & 0xff, tg = (to >> 8) & 0xff, tb = to & 0xff;
-    const r = Math.round(fr + (tr - fr) * t);
-    const g = Math.round(fg + (tg - fg) * t);
-    const b = Math.round(fb + (tb - fb) * t);
-    return (r << 16) | (g << 8) | b;
+    this.debugGraphics.lineStyle(3, color, glowAlpha * 0.7);
+    this.debugGraphics.beginPath();
+    this.debugGraphics.moveTo(qx - tx * tangentSpread, qy - ty * tangentSpread);
+    this.debugGraphics.lineTo(qx + tx * tangentSpread, qy + ty * tangentSpread);
+    this.debugGraphics.strokePath();
   }
 }
